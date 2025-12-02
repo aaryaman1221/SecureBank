@@ -12,7 +12,7 @@ A full-stack personal finance application featuring homomorphic encryption for p
 ### 🏠 Main Dashboard
 | Account Overview | Transfer Funds | Future Value Projector |
 | :---: | :---: | :---: |
-| ![Dashboard Overview](assets/home_overview.png) | ![Transfer UI](assets/home_transfer.png) | ![FV Calculator](assets/home_calc.png) |
+| ![Dashboard Overview](assets/dashboard_main.png) | ![Transfer UI](assets/dashboard_transfer.png) | ![FV Calculator](assets/dashboard_calc.png) |
 
 ### 📈 Investments & Analytics
 | Live Market Data | Portfolio Performance |
@@ -83,6 +83,3 @@ python backend/app.py
 ```bash
 streamlit run "frontend/_🏠_Dashboard.py"
 ```
-
-## 📄 License
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
