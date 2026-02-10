@@ -1,0 +1,18 @@
+[theme]
+# Blue for buttons and widgets
+primaryColor="#007BFF"
+
+# --- THIS IS THE FIX ---
+# A light grey for the main page background
+backgroundColor="#F0F2F6"
+
+# White for the sidebar, cards, and tab backgrounds
+secondaryBackgroundColor="#FFFFFF"
+
+# Black for text
+textColor="#0D1117"
+
+font="sans serif"
+
+[ui]
+hideTopBar = true
