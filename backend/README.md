@@ -53,5 +53,5 @@ This application was built with security as a primary focus:
     - In the `backend/` folder, create a `.env` file and add your secret keys (database password, JWT secret, AES key).
 
 5.  **Run the servers:**
-    - In one terminal, run the backend: `python3 backend/app.py`
+    - In one terminal, run the backends: `python3 backend/app.py`
     - In another terminal, run the frontend: `streamlit run frontend/dashboard.py`
