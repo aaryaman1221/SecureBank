@@ -315,8 +315,7 @@ def github_webhook():
 
 
 @app.route('/github/summaries', methods=['GET'])
-@token_required
-def github_summaries(current_user):
+def github_summaries():
     repo = request.args.get('repo')
     keyword = request.args.get('q')
     limit = min(int(request.args.get('limit', 10)), 50)
@@ -325,8 +324,7 @@ def github_summaries(current_user):
 
 
 @app.route('/github/chat', methods=['POST'])
-@token_required
-def github_chat(current_user):
+def github_chat():
     body = request.get_json(silent=True) or {}
     question = (body.get('question') or '').strip()
     repo = body.get('repo')

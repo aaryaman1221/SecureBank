@@ -16,7 +16,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- Custom CSS (Unchanged) ---
+# --- Custom CSS ---
 st.markdown("""
 <style>
 /* ... (all your CSS is unchanged) ... */
@@ -66,16 +66,15 @@ div[data-baseweb="select"] div {
     font-size: 1.1rem !important; 
 }
 
-/* --- (NEW) RULE FOR SIDEBAR NAV LINKS (e.g., "dashboard") --- */
+/* --- RULE FOR SIDEBAR NAV LINKS (e.g., "dashboard") --- */
 [data-testid="stSidebarNavLink"] span {
     font-size: 1.1rem !important; /* Use the same size */
 }
 
-/* --- (NEW) RULE FOR METRIC LABELS (e.g., "Bitcoin Price") --- */
+/* --- RULE FOR METRIC LABELS (e.g., "Bitcoin Price") --- */
 [data-testid="stMetricLabel"] {
     font-size: 1.1rem !important; 
 }
-/* --- END NEW RULE --- */
 
 /* ========================================================================= */
 /* --- START: [COMPUTATION LOADER CSS] --- */
@@ -123,7 +122,6 @@ div[data-baseweb="select"] div {
     100% { transform: translateY(-80px) scale(1.2); opacity: 0; }
 }
 
-/* ... (all CSS symbols unchanged) ... */
 .symbol-1 { left: 15%; animation-delay: 0s; }
 .symbol-2 { left: 35%; animation-delay: 1s; font-size: 1.2rem; color: #DC3545; }
 .symbol-3 { left: 55%; animation-delay: 0.5s; font-size: 1.7rem; }
@@ -266,17 +264,17 @@ class PaillierEncoder(json.JSONEncoder):
             return {'public_key': {'n': obj.public_key.n}, 'ciphertext': obj.ciphertext(be_secure=False)}
         return super().default(self)
 
-# --- Session Init (Unchanged) ---
+# --- Session Init ---
 def init_session_state():
     defaults = {
         'logged_in': False, 'username': None, 'public_key': None,
         'private_key': None, 'accounts': pd.DataFrame(),
-        'jwt_token': None
+        'jwt_token': None, 'messages': []  # Added chat history
     }
     for key, value in defaults.items():
         if key not in st.session_state: st.session_state[key] = value
 
-# --- Helper Functions (Unchanged) ---
+# --- Helper Functions ---
 def get_auth_headers():
     if "jwt_token" in st.session_state and st.session_state.jwt_token:
         return {"authorization": f"Bearer {st.session_state.jwt_token}"}
@@ -309,14 +307,13 @@ def safe_float(val, default=0.0):
 
 # --- Main Dashboard ---
 def main_app():
-    # --- START: NEW STICKY LOGOUT BUTTON ---
+    # --- STICKY LOGOUT BUTTON ---
     with st.sidebar:
         if st.button("Logout", key="global_logout"):
             for key in list(st.session_state.keys()):
-                if key != 'page_scripts': # Don't delete the special key
+                if key != 'page_scripts': 
                     del st.session_state[key]
             st.rerun()
-    # --- END: NEW STICKY LOGOUT BUTTON ---
 
     st.title(f"Welcome to SecureBank, {st.session_state.username}!")
     st.info("Navigate to the **📈 Investments** page in the sidebar to track your portfolio.", icon="👈")
@@ -329,11 +326,9 @@ def main_app():
     # --- SECTION 1 (ACCOUNTS) ---
     st.markdown('<h2 class="section-title-blue">🏦 Manage Your Accounts</h2>', unsafe_allow_html=True)
     
-    # --- Tabs (Unchanged) ---
     tab1, tab2, tab3 = st.tabs(["My Accounts", "Add Account", "Transfer Funds"])
     
     with tab1:
-        # ... (tab1 content is unchanged) ...
         if not st.session_state.accounts.empty:
             cols = st.columns(3) 
             for index, row in st.session_state.accounts.iterrows():
@@ -356,18 +351,14 @@ def main_app():
                             c1, c2 = st.columns(2)
                             if c1.form_submit_button("Save Changes"):
                                 requests.put(f"{BACKEND_URL}/accounts/{acc_id}", headers=get_auth_headers(), json={'account_name': new_name, 'balance': new_balance})
-                                fetch_accounts(); st.rerun() # st.rerun() is OK here, it just reloads the tab
+                                fetch_accounts(); st.rerun()
                             if c2.form_submit_button("Delete", type="primary"):
                                 requests.delete(f"{BACKEND_URL}/accounts/{acc_id}", headers=get_auth_headers())
-                                fetch_accounts(); st.rerun() # st.rerun() is OK here
+                                fetch_accounts(); st.rerun()
         else:
             st.info("You have no accounts yet. Add one in the tab above 👆")
     
-    # =========================================================================
-    # --- START: [FIX 1] ---
-    # =========================================================================
     with tab2:
-        # --- REMOVED clear_on_submit=True ---
         with st.form("add_account_form"): 
             st.subheader("➕ Add New Account")
             acc_name = st.text_input("Account Name")
@@ -377,23 +368,14 @@ def main_app():
                 payload = {'account_name': acc_name, 'balance': acc_balance}
                 requests.post(f"{BACKEND_URL}/accounts", headers=get_auth_headers(), json=payload)
                 fetch_accounts()
-                st.success("Account added!") # Show success message
-                # --- NO st.rerun() ---
-                # This lets the form submit complete, which will JUMP to tab 1
-    # =========================================================================
-    # --- END: [FIX 1] ---
-    # =========================================================================
+                st.success("Account added!") 
 
-    # =========================================================================
-    # --- START: [FIX 2] ---
-    # =========================================================================
     with tab3:
         st.subheader("💸 Transfer Between Your Accounts")
         accounts_df = st.session_state.accounts
         if len(accounts_df) < 2:
             st.info("You need at least two accounts to make a transfer.")
         else:
-            # --- REMOVED clear_on_submit=True ---
             with st.form("transfer_form"):
                 account_names = accounts_df['account_name'].tolist()
                 
@@ -416,7 +398,7 @@ def main_app():
                     
                     if from_account_name == to_account_name:
                         st.warning("Cannot transfer to the same account. No changes made.")
-                        st.rerun() # --- st.rerun() will STAY on this tab
+                        st.rerun()
                     
                     else:
                         from_account = accounts_df[accounts_df['account_name'] == from_account_name].iloc[0]
@@ -424,7 +406,7 @@ def main_app():
                         
                         if Decimal(str(amount)) > Decimal(str(from_account['balance'])):
                             st.error("Insufficient funds in the 'From' account.")
-                            st.rerun() # --- st.rerun() will STAY on this tab
+                            st.rerun()
                         
                         else:
                             payload = {'from_account_id': int(from_account['id']), 'to_account_id': int(to_account['id']), 'amount': str(amount)}
@@ -433,20 +415,15 @@ def main_app():
                                 response.raise_for_status()
                                 st.success("Transfer successful!")
                                 fetch_accounts()
-                                # --- NO st.rerun() ---
-                                # This lets the form submit complete, which will JUMP to tab 1
                                 
                             except requests.exceptions.RequestException as e:
                                 error_msg = e.response.json().get('error', 'An unknown error occurred.')
                                 st.error(f"Transfer failed: {error_msg}")
-                                st.rerun() # --- st.rerun() will STAY on this tab
-    # =========================================================================
-    # --- END: [FIX 2] ---
-    # =========================================================================
+                                st.rerun()
     
     st.divider()
     
-    # --- SECTION 2 (ANALYTICS) (Unchanged) ---
+    # --- SECTION 2 (ANALYTICS) ---
     st.markdown('<h2 class="section-title-red">🔐 Privacy-Preserving Analytics</h2>', unsafe_allow_html=True)
     analytics_tab, = st.tabs(["**Run Secure Analysis**"])
     with analytics_tab:
@@ -536,7 +513,7 @@ def main_app():
     
     st.divider()
     
-    # --- SECTION 3 (FUTURE VALUE) (Unchanged) ---
+    # --- SECTION 3 (FUTURE VALUE) ---
     st.markdown('<h2 class="section-title-orange">📈 Future Value Calculator</h2>', unsafe_allow_html=True)
     fv_tab, = st.tabs(["**Run Projection**"])
     with fv_tab:
@@ -634,9 +611,73 @@ def main_app():
                         result_action()
         else:
             st.info("Add an account to use the Future Value Calculator.")
+            
+    st.divider()
+    
+    # --- SECTION 4 (AI ASSISTANT) ---
+    st.markdown('<h2 class="section-title-blue">🤖 GitHub AI Assistant</h2>', unsafe_allow_html=True)
+    st.markdown("Ask me anything about the recent codebase changes!")
+
+    # Display chat messages from history on app rerun
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # React to user input
+    if prompt := st.chat_input("E.g., What just changed in the README file?"):
+        
+        # Display user message immediately
+        st.chat_message("user").markdown(prompt)
+        
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        # Fetch response from your Flask backend
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            message_placeholder.markdown("Analyzing repository...")
+            
+            try:
+                # Use existing auth headers but ensure JSON content type
+                headers = get_auth_headers()
+                headers["Content-Type"] = "application/json"
+                
+                response = requests.post(
+                    f"{BACKEND_URL}/github/chat",
+                    json={"question": prompt},
+                    headers=headers
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if "error" in data:
+                        answer = f"**Backend Error:** {data['error']}"
+                        message_placeholder.error(answer)
+                    else:
+                        answer = data.get("answer", "I couldn't generate an answer.")
+                        message_placeholder.markdown(answer)
+                        
+                        if "matches" in data and len(data["matches"]) > 0:
+                            with st.expander("View Source Commits"):
+                                st.json(data["matches"])
+                                
+                elif response.status_code == 401:
+                    answer = "Authentication failed. Did you re-enable the `@token_required` decorator without passing a valid token?"
+                    message_placeholder.error(answer)
+                else:
+                    answer = f"Error: Backend returned status code {response.status_code}"
+                    message_placeholder.error(answer)
+                    
+            except requests.exceptions.ConnectionError:
+                answer = "Error: Could not connect to the backend. Is your Flask server running?"
+                message_placeholder.error(answer)
+
+            # Add assistant response to chat history
+            st.session_state.messages.append({"role": "assistant", "content": answer})
     
     st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown("<div class='footer'>© 2025 SecureBank </div>", unsafe_allow_html=True)
+    st.markdown("<div class='footer'>© 2026 SecureBank </div>", unsafe_allow_html=True)
 
 # --- LOGIN LOADER FUNCTION (Unchanged) ---
 def perform_login_and_show_progress():
@@ -713,7 +754,7 @@ def auth_view():
                 st.session_state.login_attempt = True
                 st.rerun() 
                 
-# --- Controller (Unchanged) ---
+# --- Controller ---
 init_session_state()
 
 if st.session_state.get('login_attempt'):

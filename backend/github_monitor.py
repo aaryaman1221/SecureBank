@@ -195,14 +195,14 @@ def render_diff_text(files):
 
 
 def _llm_client_config():
-    api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("XAI_API_KEY")
-    base_url = os.getenv("LLM_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-    return api_key, base_url, model
+    api_key = os.getenv("LLM_API_KEY") 
+    model = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+    return api_key, model
 
 
 def summarize_with_llm(repo_full_name, event_type, actor_login, meta, compact_files, raw_diff):
-    api_key, base_url, model = _llm_client_config()
+    api_key, model = _llm_client_config()
+    
     file_overview = "\n".join(
         [
             f"- {item['filename']} ({item.get('status', 'modified')} | +{item.get('additions', 0)} / -{item.get('deletions', 0)})"
@@ -226,44 +226,32 @@ Diff:
     if not api_key:
         return heuristic_summary(repo_full_name, event_type, compact_files, meta)
 
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    
     payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert senior developer reviewing code changes. "
-                    "Explain what changed and why it matters in plain English. "
-                    "Do not recite code lines. Focus on behavior, architecture, bug fixes, and risks. "
-                    "Keep it to at most 3 short paragraphs."
-                ),
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 600,
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+        "systemInstruction": {
+            "parts": [{"text": "You are an expert senior developer reviewing code changes. Explain what changed and why it matters in plain English. Do not recite code lines. Focus on behavior, architecture, bug fixes, and risks. Keep it to at most 3 short paragraphs."}]
+        },
+        "contents": [{
+            "parts": [{"text": user_prompt}]
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 600
+        }
     }
 
     try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=60,
-        )
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
-        return (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            .strip()
-            or heuristic_summary(repo_full_name, event_type, compact_files, meta)
-        )
+        
+        # Parse Gemini's JSON structure
+        generated_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        
+        return generated_text or heuristic_summary(repo_full_name, event_type, compact_files, meta)
+        
     except Exception as exc:
         logger.exception("LLM summary failed: %s", exc)
         return heuristic_summary(repo_full_name, event_type, compact_files, meta)
@@ -462,7 +450,8 @@ def fetch_recent_summaries(get_db, repository_full_name=None, limit=10, keyword=
 
 
 def answer_from_summaries(question, summaries):
-    api_key, base_url, model = _llm_client_config()
+    api_key, model = _llm_client_config()
+    
     condensed_context = "\n\n".join(
         [
             f"Repo: {item['repository_full_name']}\n"
@@ -483,44 +472,32 @@ def answer_from_summaries(question, summaries):
             f"The most recent one is for {top['repository_full_name']} ({top['event_type']}): {top['summary_text']}"
         )
 
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    
     payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a helpful engineering assistant. Answer the user's question using only the provided GitHub change summaries. "
-                    "If the context is insufficient, say what is missing and mention the most relevant summaries."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Question: {question}\n\nRelevant change summaries:\n{condensed_context}",
-            },
-        ],
-        "temperature": 0.2,
-        "max_tokens": 500,
+        "systemInstruction": {
+            "parts": [{"text": "You are a helpful engineering assistant. Answer the user's question using only the provided GitHub change summaries. If the context is insufficient, say what is missing and mention the most relevant summaries."}]
+        },
+        "contents": [{
+            "parts": [{"text": f"Question: {question}\n\nRelevant change summaries:\n{condensed_context}"}]
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 500
+        }
     }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+
     try:
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=60,
-        )
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
-        return (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-            .strip()
-            or "I could not generate an answer from the stored summaries."
-        )
+        
+        # Parse Gemini's JSON structure
+        generated_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        
+        return generated_text or "I could not generate an answer from the stored summaries."
+        
     except Exception as exc:
         logger.exception("LLM chat answer failed: %s", exc)
         return "I could not generate an answer from the stored summaries."
