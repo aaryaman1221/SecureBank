@@ -15,10 +15,18 @@ import logging
 import time
 import yfinance as yf
 import pandas as pd
+from github_monitor import (
+    answer_from_summaries,
+    build_summary_query_result,
+    enqueue_github_event,
+    ensure_github_tables,
+    fetch_recent_summaries,
+    verify_github_signature,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 app = Flask(__name__)
 
 # --- Configuration ---
@@ -287,6 +295,53 @@ def compute(current_user):
     except Exception as e:
         app.logger.error(f"Homomorphic computation error: {e}")
         return jsonify({'error': f'Computation error: {e}'}), 400
+
+@app.route('/webhooks/github', methods=['POST'])
+def github_webhook():
+    raw_body = request.get_data()
+    delivery_id = request.headers.get('X-GitHub-Delivery', str(int(time.time() * 1000)))
+    event_type = request.headers.get('X-GitHub-Event', 'unknown')
+    secret = os.getenv('GITHUB_WEBHOOK_SECRET')
+
+    if not verify_github_signature(raw_body, request.headers.get('X-Hub-Signature-256'), secret):
+        return jsonify({'error': 'Invalid GitHub signature'}), 401
+
+    payload = request.get_json(silent=True) or {}
+    if event_type not in {'push', 'pull_request'}:
+        return jsonify({'message': f'Ignored event type: {event_type}'}), 200
+
+    enqueue_github_event(get_db, payload, event_type, delivery_id)
+    return jsonify({'message': 'Webhook received and queued for processing', 'delivery_id': delivery_id}), 202
+
+
+@app.route('/github/summaries', methods=['GET'])
+@token_required
+def github_summaries(current_user):
+    repo = request.args.get('repo')
+    keyword = request.args.get('q')
+    limit = min(int(request.args.get('limit', 10)), 50)
+    summaries = fetch_recent_summaries(get_db, repository_full_name=repo, limit=limit, keyword=keyword)
+    return jsonify(summaries), 200
+
+
+@app.route('/github/chat', methods=['POST'])
+@token_required
+def github_chat(current_user):
+    body = request.get_json(silent=True) or {}
+    question = (body.get('question') or '').strip()
+    repo = body.get('repo')
+    limit = min(int(body.get('limit', 8)), 20)
+
+    if not question:
+        return jsonify({'error': 'question is required'}), 400
+
+    summaries = fetch_recent_summaries(get_db, repository_full_name=repo, limit=limit, keyword=body.get('keyword'))
+    ranked = build_summary_query_result(question, summaries)
+    answer = answer_from_summaries(question, ranked[:limit])
+    return jsonify({'question': question, 'answer': answer, 'matches': ranked[:limit]}), 200
+
+
+ensure_github_tables(get_db)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)
