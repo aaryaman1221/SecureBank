@@ -11,3 +11,8 @@ __pycache__/
 # IDE specific files
 .vscode/
 .idea/
+
+.env
+backend/.env
+venv/
+__pycache__/
