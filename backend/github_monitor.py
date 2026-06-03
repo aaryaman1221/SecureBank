@@ -165,7 +165,7 @@ def render_diff_text(files):
 
 def _llm_client_config():
     api_key = os.getenv("LLM_API_KEY") 
-    model = os.getenv("LLM_MODEL", "gemini-2.5-flash")
+    model = os.getenv("LLM_MODEL", "gemini-1.5-flash")
     return api_key, model
 
 def summarize_with_llm(repo_full_name, event_type, actor_login, meta, compact_files, raw_diff):
@@ -525,9 +525,10 @@ def fetch_recent_summaries(get_db, repository_full_name=None, limit=10, keyword=
 #answe from summaries upgraded
 
 def answer_from_summaries(question, summaries):
-    api_key, model = _llm_client_config()
+    api_key = os.getenv("LLM_API_KEY") 
+    # Force a stable, known model that supports systemInstructions
+    model = os.getenv("LLM_MODEL", "gemini-1.5-flash") 
     
-    # UPGRADE 1: Inject the actual files_json into the context so the LLM isn't blind
     condensed_context = "\n\n".join(
         [
             f"Repo: {item['repository_full_name']}\n"
@@ -541,55 +542,70 @@ def answer_from_summaries(question, summaries):
     )
 
     if not api_key:
-        if not summaries:
-            return "No stored GitHub change summaries match that query yet."
-        top = summaries[0]
-        return (
-            f"I found {len(summaries)} relevant change summary(ies). "
-            f"The most recent one is for {top['repository_full_name']} ({top['event_type']}): {top['summary_text']}"
-        )
+        return "API Key missing. Cannot generate answer."
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     
-    # UPGRADE 2: Stop telling it to complain about missing context. Tell it to infer.
     payload = {
         "systemInstruction": {
-            "parts": [{"text": "You are a senior engineering assistant. Answer the user's question using the provided GitHub change summaries and file lists. Be direct, insightful, and conversational. Do not complain about insufficient context; deduce what you can from the file names, additions, and deletions, and summarize the technical impact."}]
+            "parts": [{"text": "You are a senior engineering assistant powered by a Graph RAG architecture. Answer the user's question using the provided GitHub change summaries. If the user asks a broad question, explain that you ran a graph impact analysis on the most recent commit, and describe how the provided commits are structurally related through shared files or modules. Be direct, analytical, and conversational."}]
         },
         "contents": [{
             "parts": [{"text": f"Question: {question}\n\nRelevant change summaries:\n{condensed_context}"}]
         }],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 1000
+            "maxOutputTokens": 2000  # Enforcing a massive limit
         }
     }
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
+        
+        # --- NEW: DEBUGGING OUTPUT ---
+        print("\n=== RAW LLM RESPONSE STATUS ===")
+        print(f"Status Code: {response.status_code}")
+        
         data = response.json()
+        print("\n=== RAW LLM JSON DATA ===")
+        print(json.dumps(data, indent=2))
+        print("===============================\n")
+        # -----------------------------
         
-        generated_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        response.raise_for_status()
         
-        return generated_text or "I could not generate an answer from the stored summaries."
+        # Safely extract text
+        try:
+            generated_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            
+            # Check if it was cut off by a limit
+            finish_reason = data["candidates"][0].get("finishReason")
+            if finish_reason != "STOP":
+                generated_text += f"\n\n*(Note: Generation halted abruptly due to: {finish_reason})*"
+                
+            return generated_text
+        except (KeyError, IndexError):
+            return f"Error extracting text. Raw data: {data}"
         
     except Exception as exc:
         logger.exception("LLM chat answer failed: %s", exc)
-        return "I could not generate an answer from the stored summaries."
+        return f"API Error: {exc}"
+
+
 def extract_search_term(question):
     """
     Extracts the core technical keyword, prioritizing obvious code artifacts.
     """
     words = re.findall(r"[A-Za-z0-9_./-]+", question.lower())
     
-    # MINIMAL list: strictly grammar, pronouns, and core GitHub concepts
+    # Just add 'there', 'any', and 'some' to this list!
     stop_words = {
         "what", "when", "where", "why", "how", "did", "the", "and", "for", "from", 
         "with", "this", "that", "on", "in", "to", "of", "a", "an", "is", "are", 
         "were", "was", "we", "they", "our", "my", "me", "them", 
-        "commit", "commits", "repo", "repository", "please", "can", "you", "show", "give"
+        "commit", "commits", "repo", "repository", "please", "can", "you", "show", "give",
+        "there", "any", "some" # <-- Added these
     }
     
     filtered = [word for word in words if len(word) > 2 and word not in stop_words]
