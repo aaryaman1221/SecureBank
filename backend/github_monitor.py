@@ -6,8 +6,7 @@ import os
 import re
 import threading
 from datetime import datetime
-
-import matplotlib
+from pathlib import Path
 
 import networkx as nx
 from networkx.readwrite import json_graph
@@ -17,7 +16,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-GRAPH_FILE = "codebase_graph.json"
+GRAPH_FILE = str(Path(__file__).resolve().with_name("codebase_graph.json"))
 
 GITHUB_API_BASE = "https://api.github.com"
 IGNORED_FILENAMES = {
