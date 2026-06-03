@@ -557,7 +557,7 @@ def answer_from_summaries(question, summaries):
         }],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 500
+            "maxOutputTokens": 2000
         }
     }
 
@@ -573,9 +573,24 @@ def answer_from_summaries(question, summaries):
         return "I could not generate an answer from the stored summaries."
 
 def extract_search_term(question):
+    """Extracts the core technical keyword, ignoring conversational filler."""
     words = re.findall(r"[A-Za-z0-9_./-]+", question.lower())
-    filtered = [word for word in words if len(word) > 2 and word not in {"what", "when", "where", "why", "how", "did", "the", "and", "for", "from", "with", "this", "that", "changed"}]
-    return filtered[0] if filtered else None
+    
+    stop_words = {
+        "what", "when", "where", "why", "how", "did", "the", "and", "for", "from", 
+        "with", "this", "that", "changed", "commits", "commit", "modified", "files", 
+        "file", "depend", "depends", "on", "in", "to", "of", "a", "an", "is", "are", 
+        "were", "was", "we", "they", "our", "my", "module", "code", "repo", "repository",
+        "give", "me", "list", "all", "date", "briefly", "describe", "them", "show", "tell", "recent", "latest"
+    }
+    
+    filtered = [word for word in words if len(word) > 2 and word not in stop_words]
+    
+    if filtered:
+        logger.info(f"Extracted search term: '{filtered[0]}' from question: '{question}'")
+        return filtered[0]
+        
+    return None
 
 def build_summary_query_result(question, summaries):
     keyword = extract_search_term(question)

@@ -290,7 +290,7 @@ if submitted and question.strip():
             # 2. Try the Knowledge Graph First
             if search_keyword:
                 st.toast(f"🔍 Searching graph for: {search_keyword}")
-                targeted_commits = get_commits_from_graph(search_keyword, max_hops=1)
+                targeted_commits = get_commits_from_graph(search_keyword, max_hops=3)
                 
                 if targeted_commits:
                     st.toast(f"🎯 Graph found {len(targeted_commits)} relevant commits!")
