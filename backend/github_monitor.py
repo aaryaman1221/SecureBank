@@ -196,7 +196,7 @@ def render_diff_text(files):
 
 def _llm_client_config():
     api_key = os.getenv("LLM_API_KEY") 
-    model = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+    model = os.getenv("LLM_MODEL", "gemini-2.5-flash")
     return api_key, model
 
 
@@ -395,6 +395,67 @@ def process_github_event(get_db, payload, event_type, delivery_id):
         "summary_text": summary_text,
         "source_url": source_url,
     }
+    # ... (existing code above)
+    else:
+        commit_sha = payload.get("after")
+        if not commit_sha:
+            raise ValueError("Missing commit SHA in webhook payload")
+        commit_payload, files = fetch_commit_files(repo_full_name, commit_sha)
+        meta["commit_message"] = (commit_payload.get("commit") or {}).get("message")
+        source_url = (commit_payload.get("html_url")) or repository.get("html_url")
+        pr_number = None
+
+    compact_files = build_compact_diff(files)
+    
+    # --- NEW: GRAPH EXTRACTION PHASE 1 ---
+    dependencies = extract_file_dependencies(compact_files)
+    if dependencies:
+        logger.info(f"Graph Extraction - Found {len(dependencies)} dependency edges:")
+        for edge in dependencies:
+            logger.info(f"  [GRAPH] {edge[0]} --[{edge[1]}]--> {edge[2]}")
+    # -------------------------------------
+
+    raw_diff = render_diff_text(compact_files)
+    summary_text = summarize_with_llm(repo_full_name, event_type, actor_login, meta, compact_files, raw_diff)
+    
+    # ... (rest of the existing code)
+
+def extract_file_dependencies(compact_files):
+    """
+    Scans code diff patches to extract import/require statements.
+    Returns a list of tuples representing graph edges: (source_file, "DEPENDS_ON", target)
+    """
+    dependencies = []
+    
+    # Regex patterns for finding module imports in common languages
+    patterns = [
+        r"^\+?\s*from\s+([a-zA-Z0-9_.-]+)\s+import",  # Python: from X import Y
+        r"^\+?\s*import\s+([a-zA-Z0-9_.-]+)",         # Python: import X
+        r"from\s+['\"]([^'\"]+)['\"]",                # JS/TS: import { x } from 'y'
+        r"require\(['\"]([^'\"]+)['\"]\)"             # JS/Node: require('x')
+    ]
+    
+    for item in compact_files:
+        source_file = item.get("filename")
+        patch = item.get("patch", "")
+        if not patch or not source_file:
+            continue
+            
+        for line in patch.split('\n'):
+            # Only look at newly added lines (+) or existing context lines ( ) in the diff
+            if not line.startswith('+') and not line.startswith(' '):
+                continue
+                
+            for pattern in patterns:
+                match = re.search(pattern, line)
+                if match:
+                    target_module = match.group(1)
+                    edge = (source_file, "DEPENDS_ON", target_module)
+                    # Prevent duplicate edges from the same file
+                    if edge not in dependencies:
+                        dependencies.append(edge)
+                        
+    return dependencies
 
 
 def enqueue_github_event(get_db, payload, event_type, delivery_id):
