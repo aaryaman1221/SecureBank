@@ -6,34 +6,26 @@ import os
 import re
 import threading
 from datetime import datetime
-from pathlib import Path
-
-import networkx as nx
-from networkx.readwrite import json_graph
 
 import mysql.connector
 import requests
+import networkx as nx
+from networkx.readwrite import json_graph
 
 logger = logging.getLogger(__name__)
 
-GRAPH_FILE = str(Path(__file__).resolve().with_name("codebase_graph.json"))
-
 GITHUB_API_BASE = "https://api.github.com"
+GRAPH_FILE = "codebase_graph.json"
+
 IGNORED_FILENAMES = {
-    ".ds_store",
-    "cargo.lock",
-    "gemfile.lock",
-    "package-lock.json",
-    "poetry.lock",
-    "pnpm-lock.yaml",
-    "yarn.lock",
+    ".ds_store", "cargo.lock", "gemfile.lock", "package-lock.json",
+    "poetry.lock", "pnpm-lock.yaml", "yarn.lock",
 }
 IGNORED_SUFFIXES = (
     ".bin", ".dll", ".exe", ".gif", ".gz", ".ico", ".jpeg", ".jpg",
     ".lock", ".mp3", ".mp4", ".pdf", ".png", ".so", ".svg", ".tar",
     ".tgz", ".ttf", ".woff", ".woff2", ".zip",
 )
-
 
 def ensure_github_tables(get_db):
     conn = get_db()
@@ -78,53 +70,6 @@ def ensure_github_tables(get_db):
         cursor.close()
         conn.close()
 
-
-def load_graph():
-    """Loads the graph from disk, or creates a new directed graph."""
-    if os.path.exists(GRAPH_FILE):
-        try:
-            with open(GRAPH_FILE, 'r') as f:
-                data = json.load(f)
-                return json_graph.node_link_graph(data)
-        except Exception as e:
-            logger.error(f"Failed to load graph: {e}")
-    return nx.DiGraph()
-
-def save_graph(G):
-    """Saves the graph state to disk."""
-    data = json_graph.node_link_data(G)
-    with open(GRAPH_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-
-def update_knowledge_graph(repo_full_name, commit_sha, dependencies):
-    """Integrates extracted dependencies into the global knowledge graph."""
-    if not dependencies:
-        return
-        
-    G = load_graph()
-    
-    # Create a node for this specific commit
-    commit_node = f"commit:{commit_sha}"
-    G.add_node(commit_node, type="commit", repo=repo_full_name)
-    
-    for source, rel, target in dependencies:
-        source_node = f"file:{source}"
-        target_node = f"module:{target}"
-        
-        # Add the file and module nodes
-        G.add_node(source_node, type="file", repo=repo_full_name)
-        G.add_node(target_node, type="module")
-        
-        # Connect the File to the Module it depends on
-        G.add_edge(source_node, target_node, relationship=rel)
-        
-        # Connect the Commit to the File it modified
-        G.add_edge(commit_node, source_node, relationship="MODIFIED")
-        
-    save_graph(G)
-    logger.info(f"Graph Updated | Nodes: {G.number_of_nodes()} | Edges: {G.number_of_edges()}")
-
-
 def verify_github_signature(raw_body, signature_header, secret):
     if not secret:
         return True
@@ -132,7 +77,6 @@ def verify_github_signature(raw_body, signature_header, secret):
         return False
     expected = hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature_header.split("=", 1)[1])
-
 
 def _github_headers():
     headers = {
@@ -144,32 +88,27 @@ def _github_headers():
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
-
 def _is_noise_file(filename):
     name = filename.lower().rsplit("/", 1)[-1]
     if name in IGNORED_FILENAMES:
         return True
     return any(name.endswith(suffix) for suffix in IGNORED_SUFFIXES)
 
-
 def _truncate(text, limit=5000):
     if not text:
         return ""
     return text if len(text) <= limit else f"{text[:limit]}\n... [truncated]"
-
 
 def _fetch_json(url, params=None):
     response = requests.get(url, headers=_github_headers(), params=params, timeout=30)
     response.raise_for_status()
     return response.json()
 
-
 def fetch_commit_files(repo_full_name, sha):
     url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/commits/{sha}"
     payload = _fetch_json(url)
     files = payload.get("files", []) or []
     return payload, files
-
 
 def fetch_pull_request_files(repo_full_name, pr_number):
     all_files = []
@@ -184,7 +123,6 @@ def fetch_pull_request_files(repo_full_name, pr_number):
             break
         page += 1
     return all_files
-
 
 def build_compact_diff(files, max_files=12):
     filtered = []
@@ -205,10 +143,8 @@ def build_compact_diff(files, max_files=12):
                 "patch": _truncate(patch, 4000),
             }
         )
-
     filtered.sort(key=lambda x: x.get("changes", 0), reverse=True)
     return filtered[:max_files]
-
 
 def render_diff_text(files):
     sections = []
@@ -227,12 +163,10 @@ def render_diff_text(files):
         )
     return "\n\n".join(sections)
 
-
 def _llm_client_config():
     api_key = os.getenv("LLM_API_KEY") 
     model = os.getenv("LLM_MODEL", "gemini-2.5-flash")
     return api_key, model
-
 
 def summarize_with_llm(repo_full_name, event_type, actor_login, meta, compact_files, raw_diff):
     api_key, model = _llm_client_config()
@@ -280,21 +214,16 @@ Diff:
         response = requests.post(url, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
-        
-        # Parse Gemini's JSON structure
         generated_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-        
         return generated_text or heuristic_summary(repo_full_name, event_type, compact_files, meta)
         
     except Exception as exc:
         logger.exception("LLM summary failed: %s", exc)
         return heuristic_summary(repo_full_name, event_type, compact_files, meta)
 
-
 def heuristic_summary(repo_full_name, event_type, compact_files, meta):
     if not compact_files:
         return f"{event_type.title()} event in {repo_full_name}. GitHub did not provide text patches for this change."
-
     parts = []
     for item in compact_files[:5]:
         filename = item["filename"]
@@ -302,11 +231,9 @@ def heuristic_summary(repo_full_name, event_type, compact_files, meta):
         additions = item.get("additions", 0)
         deletions = item.get("deletions", 0)
         parts.append(f"{filename} ({status}, +{additions}/-{deletions})")
-
     extra = ""
     if len(compact_files) > 5:
         extra = f" and {len(compact_files) - 5} more file(s)"
-
     action = meta.get("action")
     action_part = f" action={action}" if action else ""
     return (
@@ -314,7 +241,6 @@ def heuristic_summary(repo_full_name, event_type, compact_files, meta):
         f"Key files touched: {', '.join(parts)}{extra}. "
         "This likely changes behavior in the listed areas and should be reviewed for impact and regressions."
     )
-
 
 def persist_event(get_db, delivery_id, event_type, payload, summary_record=None):
     conn = get_db()
@@ -341,14 +267,8 @@ def persist_event(get_db, delivery_id, event_type, payload, summary_record=None)
                 payload_json = VALUES(payload_json)
             """,
             (
-                delivery_id,
-                event_type,
-                repo_full_name,
-                actor_login,
-                commit_sha,
-                pr_number,
-                source_url,
-                json.dumps(payload, default=str),
+                delivery_id, event_type, repo_full_name, actor_login,
+                commit_sha, pr_number, source_url, json.dumps(payload, default=str),
             ),
         )
 
@@ -360,16 +280,9 @@ def persist_event(get_db, delivery_id, event_type, payload, summary_record=None)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    delivery_id,
-                    event_type,
-                    repo_full_name,
-                    actor_login,
-                    commit_sha,
-                    pr_number,
-                    source_url,
-                    summary_record["summary_text"],
-                    summary_record.get("diff_text"),
-                    summary_record.get("files_json"),
+                    delivery_id, event_type, repo_full_name, actor_login,
+                    commit_sha, pr_number, source_url, summary_record["summary_text"],
+                    summary_record.get("diff_text"), summary_record.get("files_json"),
                 ),
             )
         conn.commit()
@@ -377,20 +290,58 @@ def persist_event(get_db, delivery_id, event_type, payload, summary_record=None)
         cursor.close()
         conn.close()
 
+# ==========================================
+# GRAPH RAG UTILS (Phases 1, 2, and 3)
+# ==========================================
+
+def load_graph():
+    """Loads the graph from disk, or creates a new directed graph."""
+    if os.path.exists(GRAPH_FILE):
+        try:
+            with open(GRAPH_FILE, 'r') as f:
+                data = json.load(f)
+                return json_graph.node_link_graph(data)
+        except Exception as e:
+            logger.error(f"Failed to load graph: {e}")
+    return nx.DiGraph()
+
+def save_graph(G):
+    """Saves the graph state to disk."""
+    data = json_graph.node_link_data(G)
+    with open(GRAPH_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def update_knowledge_graph(repo_full_name, commit_sha, dependencies):
+    """Integrates extracted dependencies into the global knowledge graph."""
+    if not dependencies:
+        return
+        
+    G = load_graph()
+    
+    commit_node = f"commit:{commit_sha}"
+    G.add_node(commit_node, type="commit", repo=repo_full_name)
+    
+    for source, rel, target in dependencies:
+        source_node = f"file:{source}"
+        target_node = f"module:{target}"
+        
+        G.add_node(source_node, type="file", repo=repo_full_name)
+        G.add_node(target_node, type="module")
+        
+        G.add_edge(source_node, target_node, relationship=rel)
+        G.add_edge(commit_node, source_node, relationship="MODIFIED")
+        
+    save_graph(G)
+    logger.info(f"Graph Updated | Nodes: {G.number_of_nodes()} | Edges: {G.number_of_edges()}")
 
 def extract_file_dependencies(compact_files):
-    """
-    Scans code diff patches to extract import/require statements.
-    Returns a list of tuples representing graph edges: (source_file, "DEPENDS_ON", target)
-    """
+    """Scans code diff patches to extract import/require statements."""
     dependencies = []
-    
-    # Regex patterns for finding module imports in common languages
     patterns = [
-        r"^\+?\s*from\s+([a-zA-Z0-9_.-]+)\s+import",  # Python: from X import Y
-        r"^\+?\s*import\s+([a-zA-Z0-9_.-]+)",         # Python: import X
-        r"from\s+['\"]([^'\"]+)['\"]",                # JS/TS: import { x } from 'y'
-        r"require\(['\"]([^'\"]+)['\"]\)"             # JS/Node: require('x')
+        r"^\+?\s*from\s+([a-zA-Z0-9_.-]+)\s+import",
+        r"^\+?\s*import\s+([a-zA-Z0-9_.-]+)",
+        r"from\s+['\"]([^'\"]+)['\"]",
+        r"require\(['\"]([^'\"]+)['\"]\)"
     ]
     
     for item in compact_files:
@@ -400,7 +351,6 @@ def extract_file_dependencies(compact_files):
             continue
             
         for line in patch.split('\n'):
-            # Only look at newly added lines (+) or existing context lines ( ) in the diff
             if not line.startswith('+') and not line.startswith(' '):
                 continue
                 
@@ -409,12 +359,58 @@ def extract_file_dependencies(compact_files):
                 if match:
                     target_module = match.group(1)
                     edge = (source_file, "DEPENDS_ON", target_module)
-                    # Prevent duplicate edges from the same file
                     if edge not in dependencies:
                         dependencies.append(edge)
-                        
     return dependencies
 
+def get_commits_from_graph(keyword, max_hops=1):
+    """Searches the graph for a file or module and returns related commit SHAs."""
+    if not os.path.exists(GRAPH_FILE):
+        return []
+        
+    G = load_graph()
+    if not G.nodes:
+        return []
+
+    target_nodes = [n for n in G.nodes if keyword.lower() in n.lower()]
+    if not target_nodes:
+        return []
+
+    undirected_G = G.to_undirected()
+    relevant_commits = set()
+    for node in target_nodes:
+        neighborhood = nx.single_source_shortest_path_length(undirected_G, node, cutoff=max_hops)
+        for neighbor in neighborhood:
+            if neighbor.startswith("commit:"):
+                relevant_commits.add(neighbor.replace("commit:", ""))
+                
+    return list(relevant_commits)
+
+def fetch_summaries_by_commits(get_db, commit_shas):
+    """Fetches full summaries from MySQL for specific SHAs."""
+    if not commit_shas:
+        return []
+        
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        format_strings = ','.join(['%s'] * len(commit_shas))
+        query = f"""
+            SELECT delivery_id, event_type, repository_full_name, actor_login, commit_sha, pr_number,
+                   source_url, summary_text, diff_text, files_json, created_at
+            FROM github_summaries
+            WHERE commit_sha IN ({format_strings})
+            ORDER BY created_at DESC
+        """
+        cursor.execute(query, tuple(commit_shas))
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+
+# ==========================================
+# PROCESSING WORKERS
+# ==========================================
 
 def process_github_event(get_db, payload, event_type, delivery_id):
     repository = payload.get("repository") or {}
@@ -452,12 +448,11 @@ def process_github_event(get_db, payload, event_type, delivery_id):
 
     compact_files = build_compact_diff(files)
     
-    # --- GRAPH EXTRACTION PHASE 1 & 2 ---
+    # Extract and store graph dependencies
     dependencies = extract_file_dependencies(compact_files)
     if dependencies:
         logger.info(f"Graph Extraction - Found {len(dependencies)} dependency edges.")
         update_knowledge_graph(repo_full_name, commit_sha, dependencies)
-    # ------------------------------------
 
     raw_diff = render_diff_text(compact_files)
     summary_text = summarize_with_llm(repo_full_name, event_type, actor_login, meta, compact_files, raw_diff)
@@ -477,7 +472,6 @@ def process_github_event(get_db, payload, event_type, delivery_id):
         "source_url": source_url,
     }
 
-
 def enqueue_github_event(get_db, payload, event_type, delivery_id):
     worker = threading.Thread(
         target=_run_github_event_worker,
@@ -485,7 +479,6 @@ def enqueue_github_event(get_db, payload, event_type, delivery_id):
         daemon=True,
     )
     worker.start()
-
 
 def _run_github_event_worker(get_db, payload, event_type, delivery_id):
     try:
@@ -528,7 +521,6 @@ def fetch_recent_summaries(get_db, repository_full_name=None, limit=10, keyword=
     finally:
         cursor.close()
         conn.close()
-
 
 def answer_from_summaries(question, summaries):
     api_key, model = _llm_client_config()
@@ -573,22 +565,17 @@ def answer_from_summaries(question, summaries):
         response = requests.post(url, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
-        
-        # Parse Gemini's JSON structure
         generated_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
-        
         return generated_text or "I could not generate an answer from the stored summaries."
         
     except Exception as exc:
         logger.exception("LLM chat answer failed: %s", exc)
         return "I could not generate an answer from the stored summaries."
 
-
 def extract_search_term(question):
     words = re.findall(r"[A-Za-z0-9_./-]+", question.lower())
     filtered = [word for word in words if len(word) > 2 and word not in {"what", "when", "where", "why", "how", "did", "the", "and", "for", "from", "with", "this", "that", "changed"}]
     return filtered[0] if filtered else None
-
 
 def build_summary_query_result(question, summaries):
     keyword = extract_search_term(question)

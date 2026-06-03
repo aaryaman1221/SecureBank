@@ -43,6 +43,9 @@ try:
         build_summary_query_result,
         ensure_github_tables,
         fetch_recent_summaries,
+        extract_search_term,
+        get_commits_from_graph,
+        fetch_summaries_by_commits
     )
     IMPORT_OK = True
 except ImportError as _ie:
@@ -105,10 +108,8 @@ def _db_config():
         "database": os.getenv("DB_NAME", "banking"),
     }
 
-
 def get_db():
     return mysql.connector.connect(**_db_config())
-
 
 def try_init_tables():
     """Returns (True, None) on success or (False, error_str) on failure."""
@@ -117,7 +118,6 @@ def try_init_tables():
         return True, None
     except Exception as exc:
         return False, str(exc)
-
 
 def get_known_repositories():
     """Returns list of distinct repo names, or empty list on DB error."""
@@ -135,7 +135,6 @@ def get_known_repositories():
     except Exception:
         return []
 
-
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
@@ -151,7 +150,6 @@ def _init_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
-
 
 _init_state()
 
@@ -178,13 +176,9 @@ with st.sidebar:
     else:
         st.error("Database error")
         st.caption(st.session_state.db_error)
-        st.info(
-            "Set DB_HOST / DB_PORT / DB_USER / DB_PASSWORD / DB_NAME "
-            "and restart the app."
-        )
+        st.info("Set DB_HOST / DB_PORT / DB_USER / DB_PASSWORD / DB_NAME and restart the app.")
 
     st.divider()
-
     st.subheader("Repositories")
 
     if st.session_state.known_repos is None:
@@ -216,7 +210,6 @@ with st.sidebar:
     st.session_state.selected_repos = selected_repos
 
     st.divider()
-
     st.subheader("Context Depth")
     st.session_state.result_limit = st.slider(
         "Max summaries fetched per answer",
@@ -227,7 +220,6 @@ with st.sidebar:
     )
 
     st.divider()
-
     if st.button("Clear chat history", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
@@ -246,34 +238,6 @@ stored by the `github_monitor` webhook.
 """
         )
 
-    with st.expander("🔧 Debug Info"):
-        import os as _os
-        api_key = _os.getenv("LLM_API_KEY", "")
-        base_url = _os.getenv("LLM_API_BASE_URL", "https://api.openai.com/v1")
-        model = _os.getenv("LLM_MODEL", "gpt-4o-mini")
-        st.markdown(f"""
-- **LLM_API_KEY**: `{"set (" + str(len(api_key)) + " chars)" if api_key else "NOT SET"}`
-- **LLM_API_BASE_URL**: `{base_url}`
-- **LLM_MODEL**: `{model}`
-- **DB_HOST**: `{_os.getenv("DB_HOST", "localhost")}`
-- **DB_NAME**: `{_os.getenv("DB_NAME", "banking")}`
-""")
-        if st.button("Test LLM connection"):
-            import requests as _req
-            try:
-                r = _req.post(
-                    f"{base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                    json={"model": model, "messages": [{"role": "user", "content": "say hi"}], "max_tokens": 10},
-                    timeout=15,
-                )
-                if r.ok:
-                    st.success(f"LLM responded: {r.json()['choices'][0]['message']['content']}")
-                else:
-                    st.error(f"HTTP {r.status_code}: {r.text[:300]}")
-            except Exception as e:
-                st.error(f"Exception: {e}")
-
 # ---------------------------------------------------------------------------
 # Chat display
 # ---------------------------------------------------------------------------
@@ -283,25 +247,19 @@ if not st.session_state.messages:
         "- *What changed in the last push to main?*\n"
         "- *Were there any bug fixes this week?*\n"
         "- *Who modified the authentication code?*\n"
-        "- *Summarise the last 5 pull requests.*"
+        "- *What commit added the react module?*"
     )
 else:
     for msg in st.session_state.messages:
         if msg["role"] == "user":
-            st.markdown(
-                f'<div class="bubble-user"> {msg["content"]}</div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(f'<div class="bubble-user"> {msg["content"]}</div>', unsafe_allow_html=True)
         else:
-            st.markdown(
-                f'<div class="bubble-bot"> {msg["content"]}</div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(f'<div class="bubble-bot"> {msg["content"]}</div>', unsafe_allow_html=True)
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Input bar
+# Input bar (Graph RAG Logic)
 # ---------------------------------------------------------------------------
 with st.form("chat_form", clear_on_submit=True):
     cols = st.columns([8, 1])
@@ -320,33 +278,38 @@ if submitted and question.strip():
     user_q = question.strip()
     st.session_state.messages.append({"role": "user", "content": user_q})
 
-    with st.spinner("Searching summaries and generating answer…"):
+    with st.spinner("Searching graph and generating answer…"):
         try:
             repos_to_query = st.session_state.selected_repos
             limit = st.session_state.result_limit
-
-            if repos_to_query:
-                all_summaries = []
-                for repo in repos_to_query:
-                    results = fetch_recent_summaries(
-                        get_db,
-                        repository_full_name=repo,
-                        limit=limit,
-                    )
-                    all_summaries.extend(results)
-                all_summaries.sort(
-                    key=lambda x: x.get("created_at") or "",
-                    reverse=True,
-                )
-                all_summaries = all_summaries[:limit]
-            else:
-                all_summaries = fetch_recent_summaries(
-                    get_db,
-                    repository_full_name=None,
-                    limit=limit,
-                )
-
+            
+            # 1. Figure out what the user is asking about
+            search_keyword = extract_search_term(user_q)
+            all_summaries = []
+            
+            # 2. Try the Knowledge Graph First
+            if search_keyword:
+                st.toast(f"🔍 Searching graph for: {search_keyword}")
+                targeted_commits = get_commits_from_graph(search_keyword, max_hops=1)
+                
+                if targeted_commits:
+                    st.toast(f"🎯 Graph found {len(targeted_commits)} relevant commits!")
+                    all_summaries = fetch_summaries_by_commits(get_db, targeted_commits)
+            
+            # 3. Fallback to basic DB search if graph finds nothing
+            if not all_summaries:
+                st.toast("⚠️ No graph connections found. Falling back to recent history.")
+                if repos_to_query:
+                    for repo in repos_to_query:
+                        all_summaries.extend(fetch_recent_summaries(get_db, repo, limit))
+                else:
+                    all_summaries = fetch_recent_summaries(get_db, limit=limit)
+                    
+            # 4. Cap results to save LLM tokens and rank them
+            all_summaries = all_summaries[:limit]
             ranked = build_summary_query_result(user_q, all_summaries)
+            
+            # 5. Generate final AI Answer
             answer = answer_from_summaries(user_q, ranked)
 
         except Exception as exc:
@@ -354,5 +317,3 @@ if submitted and question.strip():
 
     st.session_state.messages.append({"role": "bot", "content": answer})
     st.rerun()
-
-# (appended at bottom — intentionally blank, real additions are inline)
