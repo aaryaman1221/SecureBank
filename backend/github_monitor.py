@@ -7,10 +7,17 @@ import re
 import threading
 from datetime import datetime
 
+import matplotlib
+
+import networkx as nx
+from networkx.readwrite import json_graph
+
 import mysql.connector
 import requests
 
 logger = logging.getLogger(__name__)
+
+GRAPH_FILE = "codebase_graph.json"
 
 GITHUB_API_BASE = "https://api.github.com"
 IGNORED_FILENAMES = {
@@ -71,6 +78,52 @@ def ensure_github_tables(get_db):
     finally:
         cursor.close()
         conn.close()
+
+
+def load_graph():
+    """Loads the graph from disk, or creates a new directed graph."""
+    if os.path.exists(GRAPH_FILE):
+        try:
+            with open(GRAPH_FILE, 'r') as f:
+                data = json.load(f)
+                return json_graph.node_link_graph(data)
+        except Exception as e:
+            logger.error(f"Failed to load graph: {e}")
+    return nx.DiGraph()
+
+def save_graph(G):
+    """Saves the graph state to disk."""
+    data = json_graph.node_link_data(G)
+    with open(GRAPH_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def update_knowledge_graph(repo_full_name, commit_sha, dependencies):
+    """Integrates extracted dependencies into the global knowledge graph."""
+    if not dependencies:
+        return
+        
+    G = load_graph()
+    
+    # Create a node for this specific commit
+    commit_node = f"commit:{commit_sha}"
+    G.add_node(commit_node, type="commit", repo=repo_full_name)
+    
+    for source, rel, target in dependencies:
+        source_node = f"file:{source}"
+        target_node = f"module:{target}"
+        
+        # Add the file and module nodes
+        G.add_node(source_node, type="file", repo=repo_full_name)
+        G.add_node(target_node, type="module")
+        
+        # Connect the File to the Module it depends on
+        G.add_edge(source_node, target_node, relationship=rel)
+        
+        # Connect the Commit to the File it modified
+        G.add_edge(commit_node, source_node, relationship="MODIFIED")
+        
+    save_graph(G)
+    logger.info(f"Graph Updated | Nodes: {G.number_of_nodes()} | Edges: {G.number_of_edges()}")
 
 
 def verify_github_signature(raw_body, signature_header, secret):
@@ -400,13 +453,12 @@ def process_github_event(get_db, payload, event_type, delivery_id):
 
     compact_files = build_compact_diff(files)
     
-    # --- NEW: GRAPH EXTRACTION PHASE 1 ---
+    # --- GRAPH EXTRACTION PHASE 1 & 2 ---
     dependencies = extract_file_dependencies(compact_files)
     if dependencies:
-        logger.info(f"Graph Extraction - Found {len(dependencies)} dependency edges:")
-        for edge in dependencies:
-            logger.info(f"  [GRAPH] {edge[0]} --[{edge[1]}]--> {edge[2]}")
-    # -------------------------------------
+        logger.info(f"Graph Extraction - Found {len(dependencies)} dependency edges.")
+        update_knowledge_graph(repo_full_name, commit_sha, dependencies)
+    # ------------------------------------
 
     raw_diff = render_diff_text(compact_files)
     summary_text = summarize_with_llm(repo_full_name, event_type, actor_login, meta, compact_files, raw_diff)
