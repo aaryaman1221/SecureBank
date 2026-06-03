@@ -522,15 +522,19 @@ def fetch_recent_summaries(get_db, repository_full_name=None, limit=10, keyword=
         cursor.close()
         conn.close()
 
+#answe from summaries upgraded
+
 def answer_from_summaries(question, summaries):
     api_key, model = _llm_client_config()
     
+    # UPGRADE 1: Inject the actual files_json into the context so the LLM isn't blind
     condensed_context = "\n\n".join(
         [
             f"Repo: {item['repository_full_name']}\n"
             f"Event: {item['event_type']}\n"
             f"Commit: {item.get('commit_sha')}\n"
             f"Summary: {item['summary_text']}\n"
+            f"Files Touched: {item.get('files_json')}\n"
             f"Time: {item.get('created_at')}"
             for item in summaries
         ]
@@ -548,16 +552,17 @@ def answer_from_summaries(question, summaries):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     
+    # UPGRADE 2: Stop telling it to complain about missing context. Tell it to infer.
     payload = {
         "systemInstruction": {
-            "parts": [{"text": "You are a helpful engineering assistant. Answer the user's question using only the provided GitHub change summaries. If the context is insufficient, say what is missing and mention the most relevant summaries."}]
+            "parts": [{"text": "You are a senior engineering assistant. Answer the user's question using the provided GitHub change summaries and file lists. Be direct, insightful, and conversational. Do not complain about insufficient context; deduce what you can from the file names, additions, and deletions, and summarize the technical impact."}]
         },
         "contents": [{
             "parts": [{"text": f"Question: {question}\n\nRelevant change summaries:\n{condensed_context}"}]
         }],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 2000
+            "maxOutputTokens": 1000
         }
     }
 
@@ -565,32 +570,42 @@ def answer_from_summaries(question, summaries):
         response = requests.post(url, headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         data = response.json()
+        
         generated_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+        
         return generated_text or "I could not generate an answer from the stored summaries."
         
     except Exception as exc:
         logger.exception("LLM chat answer failed: %s", exc)
         return "I could not generate an answer from the stored summaries."
-
 def extract_search_term(question):
-    """Extracts the core technical keyword, ignoring conversational filler."""
+    """
+    Extracts the core technical keyword, prioritizing obvious code artifacts.
+    """
     words = re.findall(r"[A-Za-z0-9_./-]+", question.lower())
     
+    # MINIMAL list: strictly grammar, pronouns, and core GitHub concepts
     stop_words = {
         "what", "when", "where", "why", "how", "did", "the", "and", "for", "from", 
-        "with", "this", "that", "changed", "commits", "commit", "modified", "files", 
-        "file", "depend", "depends", "on", "in", "to", "of", "a", "an", "is", "are", 
-        "were", "was", "we", "they", "our", "my", "module", "code", "repo", "repository",
-        "give", "me", "list", "all", "date", "briefly", "describe", "them", "show", "tell", "recent", "latest"
+        "with", "this", "that", "on", "in", "to", "of", "a", "an", "is", "are", 
+        "were", "was", "we", "they", "our", "my", "me", "them", 
+        "commit", "commits", "repo", "repository", "please", "can", "you", "show", "give"
     }
     
     filtered = [word for word in words if len(word) > 2 and word not in stop_words]
     
-    if filtered:
-        logger.info(f"Extracted search term: '{filtered[0]}' from question: '{question}'")
-        return filtered[0]
+    if not filtered:
+        return None
         
-    return None
+    # STRATEGY 1: Prioritize words that are obviously files or modules (e.g., auth.py, db_utils)
+    for word in filtered:
+        if '.' in word or '_' in word or '/' in word:
+            logger.info(f"Extracted technical artifact: '{word}' from: '{question}'")
+            return word
+            
+    # STRATEGY 2: Fallback to the first non-stopword
+    logger.info(f"Extracted search term: '{filtered[0]}' from: '{question}'")
+    return filtered[0]
 
 def build_summary_query_result(question, summaries):
     keyword = extract_search_term(question)
