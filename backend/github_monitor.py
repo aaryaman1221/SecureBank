@@ -23,27 +23,9 @@ IGNORED_FILENAMES = {
     "yarn.lock",
 }
 IGNORED_SUFFIXES = (
-    ".bin",
-    ".dll",
-    ".exe",
-    ".gif",
-    ".gz",
-    ".ico",
-    ".jpeg",
-    ".jpg",
-    ".lock",
-    ".mp3",
-    ".mp4",
-    ".pdf",
-    ".png",
-    ".so",
-    ".svg",
-    ".tar",
-    ".tgz",
-    ".ttf",
-    ".woff",
-    ".woff2",
-    ".zip",
+    ".bin", ".dll", ".exe", ".gif", ".gz", ".ico", ".jpeg", ".jpg",
+    ".lock", ".mp3", ".mp4", ".pdf", ".png", ".so", ".svg", ".tar",
+    ".tgz", ".ttf", ".woff", ".woff2", ".zip",
 )
 
 
@@ -344,82 +326,6 @@ def persist_event(get_db, delivery_id, event_type, payload, summary_record=None)
         conn.close()
 
 
-def process_github_event(get_db, payload, event_type, delivery_id):
-    repository = payload.get("repository") or {}
-    repo_full_name = repository.get("full_name")
-    if not repo_full_name:
-        raise ValueError("Missing repository.full_name in webhook payload")
-
-    actor_login = (payload.get("sender") or {}).get("login")
-    meta = {
-        "delivery_id": delivery_id,
-        "event_type": event_type,
-        "action": payload.get("action"),
-        "head_commit": payload.get("head_commit", {}),
-        "ref": payload.get("ref"),
-        "before": payload.get("before"),
-        "after": payload.get("after"),
-    }
-
-    if event_type == "pull_request":
-        pr = payload.get("pull_request") or {}
-        pr_number = pr.get("number")
-        if not pr_number:
-            raise ValueError("Missing pull_request.number in webhook payload")
-        files = fetch_pull_request_files(repo_full_name, pr_number)
-        commit_sha = ((pr.get("head") or {}).get("sha")) or payload.get("after")
-        source_url = pr.get("html_url") or repository.get("html_url")
-    else:
-        commit_sha = payload.get("after")
-        if not commit_sha:
-            raise ValueError("Missing commit SHA in webhook payload")
-        commit_payload, files = fetch_commit_files(repo_full_name, commit_sha)
-        meta["commit_message"] = (commit_payload.get("commit") or {}).get("message")
-        source_url = (commit_payload.get("html_url")) or repository.get("html_url")
-        pr_number = None
-
-    compact_files = build_compact_diff(files)
-    raw_diff = render_diff_text(compact_files)
-    summary_text = summarize_with_llm(repo_full_name, event_type, actor_login, meta, compact_files, raw_diff)
-    summary_record = {
-        "summary_text": summary_text,
-        "diff_text": raw_diff,
-        "files_json": json.dumps(compact_files, ensure_ascii=True, default=str),
-    }
-
-    persist_event(get_db, delivery_id, event_type, payload, summary_record)
-    return {
-        "repository_full_name": repo_full_name,
-        "commit_sha": commit_sha,
-        "pr_number": pr_number,
-        "summary_text": summary_text,
-        "source_url": source_url,
-    }
-    # ... (existing code above)
-    else:
-        commit_sha = payload.get("after")
-        if not commit_sha:
-            raise ValueError("Missing commit SHA in webhook payload")
-        commit_payload, files = fetch_commit_files(repo_full_name, commit_sha)
-        meta["commit_message"] = (commit_payload.get("commit") or {}).get("message")
-        source_url = (commit_payload.get("html_url")) or repository.get("html_url")
-        pr_number = None
-
-    compact_files = build_compact_diff(files)
-    
-    # --- NEW: GRAPH EXTRACTION PHASE 1 ---
-    dependencies = extract_file_dependencies(compact_files)
-    if dependencies:
-        logger.info(f"Graph Extraction - Found {len(dependencies)} dependency edges:")
-        for edge in dependencies:
-            logger.info(f"  [GRAPH] {edge[0]} --[{edge[1]}]--> {edge[2]}")
-    # -------------------------------------
-
-    raw_diff = render_diff_text(compact_files)
-    summary_text = summarize_with_llm(repo_full_name, event_type, actor_login, meta, compact_files, raw_diff)
-    
-    # ... (rest of the existing code)
-
 def extract_file_dependencies(compact_files):
     """
     Scans code diff patches to extract import/require statements.
@@ -456,6 +362,69 @@ def extract_file_dependencies(compact_files):
                         dependencies.append(edge)
                         
     return dependencies
+
+
+def process_github_event(get_db, payload, event_type, delivery_id):
+    repository = payload.get("repository") or {}
+    repo_full_name = repository.get("full_name")
+    if not repo_full_name:
+        raise ValueError("Missing repository.full_name in webhook payload")
+
+    actor_login = (payload.get("sender") or {}).get("login")
+    meta = {
+        "delivery_id": delivery_id,
+        "event_type": event_type,
+        "action": payload.get("action"),
+        "head_commit": payload.get("head_commit", {}),
+        "ref": payload.get("ref"),
+        "before": payload.get("before"),
+        "after": payload.get("after"),
+    }
+
+    if event_type == "pull_request":
+        pr = payload.get("pull_request") or {}
+        pr_number = pr.get("number")
+        if not pr_number:
+            raise ValueError("Missing pull_request.number in webhook payload")
+        files = fetch_pull_request_files(repo_full_name, pr_number)
+        commit_sha = ((pr.get("head") or {}).get("sha")) or payload.get("after")
+        source_url = pr.get("html_url") or repository.get("html_url")
+    else:
+        commit_sha = payload.get("after")
+        if not commit_sha:
+            raise ValueError("Missing commit SHA in webhook payload")
+        commit_payload, files = fetch_commit_files(repo_full_name, commit_sha)
+        meta["commit_message"] = (commit_payload.get("commit") or {}).get("message")
+        source_url = (commit_payload.get("html_url")) or repository.get("html_url")
+        pr_number = None
+
+    compact_files = build_compact_diff(files)
+    
+    # --- NEW: GRAPH EXTRACTION PHASE 1 ---
+    dependencies = extract_file_dependencies(compact_files)
+    if dependencies:
+        logger.info(f"Graph Extraction - Found {len(dependencies)} dependency edges:")
+        for edge in dependencies:
+            logger.info(f"  [GRAPH] {edge[0]} --[{edge[1]}]--> {edge[2]}")
+    # -------------------------------------
+
+    raw_diff = render_diff_text(compact_files)
+    summary_text = summarize_with_llm(repo_full_name, event_type, actor_login, meta, compact_files, raw_diff)
+    summary_record = {
+        "summary_text": summary_text,
+        "diff_text": raw_diff,
+        "files_json": json.dumps(compact_files, ensure_ascii=True, default=str),
+    }
+
+    persist_event(get_db, delivery_id, event_type, payload, summary_record)
+    
+    return {
+        "repository_full_name": repo_full_name,
+        "commit_sha": commit_sha,
+        "pr_number": pr_number,
+        "summary_text": summary_text,
+        "source_url": source_url,
+    }
 
 
 def enqueue_github_event(get_db, payload, event_type, delivery_id):
