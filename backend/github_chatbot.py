@@ -29,7 +29,9 @@ try:
         fetch_recent_summaries,
         extract_search_term,
         get_commits_from_graph,
-        fetch_summaries_by_commits
+        fetch_summaries_by_commits,
+        get_bootstrap_status,
+        enqueue_bootstrap,
     )
     IMPORT_OK = True
 except ImportError as _ie:
@@ -71,7 +73,7 @@ def _db_config():
         "host":     os.getenv("DB_HOST", "localhost"),
         "port":     int(os.getenv("DB_PORT", 3306)),
         "user":     os.getenv("DB_USER", "root"),
-        "password": os.getenv("DB_PASSWORD", "Pass@#123"),
+        "password": os.environ["DB_PASSWORD"],
         "database": os.getenv("DB_NAME", "banking"),
     }
 
@@ -170,6 +172,49 @@ with st.sidebar:
             )
 
     st.session_state.selected_repos = selected_repos
+
+    # -------------------------------------------------------------------
+    # Bootstrap Status Section
+    # -------------------------------------------------------------------
+    st.divider()
+    st.subheader("🔧 Bootstrap Status")
+
+    if known_repos:
+        for repo in known_repos:
+            try:
+                bs = get_bootstrap_status(get_db, repo)
+                if bs and bs.get("status") == "completed":
+                    files_n = bs.get("files_scanned", 0)
+                    commits_n = bs.get("commits_processed", 0)
+                    st.markdown(
+                        f"🟢 **{repo}** — Indexed "
+                        f"({files_n} files, {commits_n} commits)"
+                    )
+                elif bs and bs.get("status") == "in_progress":
+                    files_n = bs.get("files_scanned", 0)
+                    commits_n = bs.get("commits_processed", 0)
+                    st.markdown(
+                        f"🟡 **{repo}** — Bootstrapping… "
+                        f"({files_n} files, {commits_n} commits so far)"
+                    )
+                    st.progress(min(commits_n / 500, 1.0))
+                elif bs and bs.get("status") == "failed":
+                    st.markdown(f"🔴 **{repo}** — Bootstrap failed")
+                    st.caption(bs.get("error_detail", "Unknown error"))
+                    if st.button(f"Retry {repo}", key=f"retry_{repo}"):
+                        enqueue_bootstrap(get_db, repo)
+                        st.toast(f"Retrying bootstrap for {repo}…")
+                        st.rerun()
+                else:
+                    st.markdown(f"⚪ **{repo}** — Not bootstrapped")
+                    if st.button(f"Bootstrap {repo}", key=f"boot_{repo}"):
+                        enqueue_bootstrap(get_db, repo)
+                        st.toast(f"Bootstrap started for {repo}!")
+                        st.rerun()
+            except Exception:
+                st.markdown(f"⚠️ **{repo}** — Status unavailable")
+    else:
+        st.caption("No repositories to bootstrap yet.")
 
     st.divider()
     st.subheader("Context Depth")

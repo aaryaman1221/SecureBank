@@ -18,9 +18,12 @@ import pandas as pd
 from github_monitor import (
     answer_from_summaries,
     build_summary_query_result,
+    enqueue_bootstrap,
     enqueue_github_event,
     ensure_github_tables,
     fetch_recent_summaries,
+    get_bootstrap_status,
+    set_bootstrap_status,
     verify_github_signature,
 )
 
@@ -307,10 +310,22 @@ def github_webhook():
         return jsonify({'error': 'Invalid GitHub signature'}), 401
 
     payload = request.get_json(silent=True) or {}
-    if event_type not in {'push', 'pull_request'}:
+    if event_type not in {'push', 'pull_request', 'pull_request_review', 'pull_request_review_comment'}:
         return jsonify({'message': f'Ignored event type: {event_type}'}), 200
 
     enqueue_github_event(get_db, payload, event_type, delivery_id)
+
+    # Auto-trigger bootstrap on first webhook per repo
+    repo_full_name = (payload.get("repository") or {}).get("full_name")
+    if repo_full_name:
+        try:
+            status = get_bootstrap_status(get_db, repo_full_name)
+            if not status or status.get("status") not in ("in_progress", "completed"):
+                enqueue_bootstrap(get_db, repo_full_name)
+                app.logger.info("Auto-triggered bootstrap for %s", repo_full_name)
+        except Exception as e:
+            app.logger.warning("Bootstrap auto-trigger check failed: %s", e)
+
     return jsonify({'message': 'Webhook received and queued for processing', 'delivery_id': delivery_id}), 202
 
 
@@ -340,6 +355,57 @@ def github_chat():
 
 
 ensure_github_tables(get_db)
+
+
+@app.route('/github/bootstrap/status', methods=['GET'])
+def github_bootstrap_status_endpoint():
+    repo = request.args.get('repo', '').strip()
+    if not repo:
+        return jsonify({'error': 'repo query parameter is required'}), 400
+    status = get_bootstrap_status(get_db, repo)
+    if not status:
+        return jsonify({
+            'repository_full_name': repo,
+            'status': None,
+            'message': 'Never bootstrapped'
+        }), 200
+    # Convert datetime objects for JSON serialization
+    for key in ('started_at', 'completed_at', 'created_at'):
+        if status.get(key) and hasattr(status[key], 'isoformat'):
+            status[key] = status[key].isoformat()
+    return jsonify(status), 200
+
+
+@app.route('/github/bootstrap', methods=['POST'])
+def github_bootstrap_trigger():
+    body = request.get_json(silent=True) or {}
+    repo = (body.get('repo') or '').strip()
+    force = body.get('force', False)
+    if not repo:
+        return jsonify({'error': 'repo is required in request body'}), 400
+
+    existing = get_bootstrap_status(get_db, repo)
+    if existing and existing.get('status') == 'in_progress':
+        return jsonify({
+            'message': 'Bootstrap already in progress',
+            'status': 'in_progress'
+        }), 200
+
+    if existing and existing.get('status') == 'completed' and not force:
+        return jsonify({
+            'message': 'Bootstrap already completed. Send force=true to re-run.',
+            'status': 'completed'
+        }), 200
+
+    # Reset status so bootstrap_repo doesn't skip it
+    if force and existing:
+        set_bootstrap_status(get_db, repo, 'pending', detail='Forced re-bootstrap')
+
+    enqueue_bootstrap(get_db, repo)
+    return jsonify({
+        'message': f'Bootstrap started for {repo}',
+        'status': 'in_progress'
+    }), 202
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)

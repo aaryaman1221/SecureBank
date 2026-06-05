@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -5,6 +6,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime
 
 import mysql.connector
@@ -16,6 +18,26 @@ logger = logging.getLogger(__name__)
 
 GITHUB_API_BASE = "https://api.github.com"
 GRAPH_FILE = "codebase_graph.json"
+BOOTSTRAP_MAX_COMMITS = int(os.getenv("BOOTSTRAP_MAX_COMMITS", 500))
+
+# File extensions to scan for full-file dependency analysis
+SOURCE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".java", ".rs",
+    ".rb", ".php", ".c", ".cpp", ".h", ".hpp", ".cs", ".swift",
+    ".kt", ".scala", ".r", ".R", ".vue", ".svelte",
+}
+
+# Patterns for identifying entry-point files
+ENTRY_POINT_NAMES = {
+    "main", "index", "app", "server", "__main__", "manage",
+    "wsgi", "asgi", "cli", "entrypoint",
+}
+
+# Directory names that indicate shared utilities
+UTILITY_DIRS = {
+    "utils", "util", "lib", "libs", "common", "shared",
+    "helpers", "helper", "core", "pkg", "internal",
+}
 
 IGNORED_FILENAMES = {
     ".ds_store", "cargo.lock", "gemfile.lock", "package-lock.json",
@@ -69,6 +91,7 @@ def ensure_github_tables(get_db):
     finally:
         cursor.close()
         conn.close()
+    ensure_bootstrap_table(get_db)
 
 def verify_github_signature(raw_body, signature_header, secret):
     if not secret:
@@ -211,8 +234,22 @@ Diff:
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
-        response.raise_for_status()
+        # EXPONENTIAL BACKOFF RETRY LOOP
+        for attempt in range(5):
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            
+            if response.status_code == 429:
+                sleep_time = 2 ** attempt  # Wait 1, 2, 4, 8, 16 seconds
+                logger.warning("429 Rate limit hit in summarize_with_llm. Retrying in %ss...", sleep_time)
+                time.sleep(sleep_time)
+                continue
+                
+            response.raise_for_status()
+            break  # Success, exit the retry loop
+        else:
+            # Exhausted retries
+            response.raise_for_status()
+            
         data = response.json()
         generated_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
         return generated_text or heuristic_summary(repo_full_name, event_type, compact_files, meta)
@@ -412,6 +449,48 @@ def fetch_summaries_by_commits(get_db, commit_shas):
 # PROCESSING WORKERS
 # ==========================================
 
+def _process_single_commit(get_db, repo_full_name, sha, actor_login, delivery_id):
+    """Processes a single commit: fetches files, extracts deps, persists summary."""
+    commit_payload, files = fetch_commit_files(repo_full_name, sha)
+    compact_files = build_compact_diff(files)
+
+    dependencies = extract_file_dependencies(compact_files)
+    if dependencies:
+        logger.info(f"Graph Extraction - Found {len(dependencies)} dependency edges.")
+        update_knowledge_graph(repo_full_name, sha, dependencies)
+
+    raw_diff = render_diff_text(compact_files)
+    meta = {
+        "event_type": "push",
+        "commit_message": (commit_payload.get("commit") or {}).get("message"),
+    }
+    summary_text = summarize_with_llm(
+        repo_full_name, "push", actor_login, meta, compact_files, raw_diff
+    )
+    source_url = commit_payload.get("html_url") or ""
+
+    summary_record = {
+        "summary_text": summary_text,
+        "diff_text": raw_diff,
+        "files_json": json.dumps(compact_files, ensure_ascii=True, default=str),
+    }
+
+    # Build a minimal payload for persist_event
+    event_payload = {
+        "repository": {"full_name": repo_full_name, "html_url": source_url},
+        "sender": {"login": actor_login},
+        "after": sha,
+    }
+    commit_delivery = f"{delivery_id}-{sha[:8]}"
+    persist_event(get_db, commit_delivery, "push", event_payload, summary_record)
+
+    return {
+        "commit_sha": sha,
+        "summary_text": summary_text,
+        "source_url": source_url,
+    }
+
+
 def process_github_event(get_db, payload, event_type, delivery_id):
     repository = payload.get("repository") or {}
     repo_full_name = repository.get("full_name")
@@ -419,15 +498,6 @@ def process_github_event(get_db, payload, event_type, delivery_id):
         raise ValueError("Missing repository.full_name in webhook payload")
 
     actor_login = (payload.get("sender") or {}).get("login")
-    meta = {
-        "delivery_id": delivery_id,
-        "event_type": event_type,
-        "action": payload.get("action"),
-        "head_commit": payload.get("head_commit", {}),
-        "ref": payload.get("ref"),
-        "before": payload.get("before"),
-        "after": payload.get("after"),
-    }
 
     if event_type == "pull_request":
         pr = payload.get("pull_request") or {}
@@ -437,39 +507,188 @@ def process_github_event(get_db, payload, event_type, delivery_id):
         files = fetch_pull_request_files(repo_full_name, pr_number)
         commit_sha = ((pr.get("head") or {}).get("sha")) or payload.get("after")
         source_url = pr.get("html_url") or repository.get("html_url")
+
+        compact_files = build_compact_diff(files)
+        dependencies = extract_file_dependencies(compact_files)
+        if dependencies:
+            logger.info(f"Graph Extraction - Found {len(dependencies)} dependency edges.")
+            update_knowledge_graph(repo_full_name, commit_sha, dependencies)
+
+        raw_diff = render_diff_text(compact_files)
+        meta = {
+            "delivery_id": delivery_id,
+            "event_type": event_type,
+            "action": payload.get("action"),
+            "head_commit": payload.get("head_commit", {}),
+            "ref": payload.get("ref"),
+        }
+        summary_text = summarize_with_llm(
+            repo_full_name, event_type, actor_login, meta, compact_files, raw_diff
+        )
+        summary_record = {
+            "summary_text": summary_text,
+            "diff_text": raw_diff,
+            "files_json": json.dumps(compact_files, ensure_ascii=True, default=str),
+        }
+        persist_event(get_db, delivery_id, event_type, payload, summary_record)
+
+        return {
+            "repository_full_name": repo_full_name,
+            "commit_sha": commit_sha,
+            "pr_number": pr_number,
+            "summary_text": summary_text,
+            "source_url": source_url,
+        }
+
+    if event_type == "pull_request_review":
+        review = payload.get("review") or {}
+        pr = payload.get("pull_request") or {}
+        pr_number = pr.get("number")
+        commit_sha = review.get("commit_id") or ((pr.get("head") or {}).get("sha"))
+        source_url = review.get("html_url") or pr.get("html_url") or repository.get("html_url")
+        review_state = review.get("state", "")  # approved, changes_requested, commented
+        review_body = review.get("body") or ""
+
+        # Fetch the PR's files so the LLM has diff context for the review
+        compact_files = []
+        raw_diff = ""
+        if pr_number:
+            try:
+                files = fetch_pull_request_files(repo_full_name, pr_number)
+                compact_files = build_compact_diff(files)
+                raw_diff = render_diff_text(compact_files)
+
+                dependencies = extract_file_dependencies(compact_files)
+                if dependencies and commit_sha:
+                    update_knowledge_graph(repo_full_name, commit_sha, dependencies)
+            except Exception as e:
+                logger.warning("Failed to fetch PR files for review context: %s", e)
+
+        meta = {
+            "delivery_id": delivery_id,
+            "event_type": event_type,
+            "action": payload.get("action"),
+            "review_state": review_state,
+            "review_body": _truncate(review_body, 2000),
+            "pr_title": pr.get("title"),
+            "pr_number": pr_number,
+        }
+        summary_text = summarize_with_llm(
+            repo_full_name, event_type, actor_login, meta, compact_files, raw_diff
+        )
+        summary_record = {
+            "summary_text": summary_text,
+            "diff_text": raw_diff,
+            "files_json": json.dumps(compact_files, ensure_ascii=True, default=str),
+        }
+        persist_event(get_db, delivery_id, event_type, payload, summary_record)
+
+        return {
+            "repository_full_name": repo_full_name,
+            "commit_sha": commit_sha,
+            "pr_number": pr_number,
+            "summary_text": summary_text,
+            "source_url": source_url,
+        }
+
+    if event_type == "pull_request_review_comment":
+        comment = payload.get("comment") or {}
+        pr = payload.get("pull_request") or {}
+        pr_number = pr.get("number")
+        commit_sha = comment.get("commit_id") or ((pr.get("head") or {}).get("sha"))
+        source_url = comment.get("html_url") or pr.get("html_url") or repository.get("html_url")
+        comment_body = comment.get("body") or ""
+        comment_path = comment.get("path") or ""
+        diff_hunk = comment.get("diff_hunk") or ""
+
+        # Build a synthetic compact_files from the comment's diff hunk
+        compact_files = []
+        if comment_path and diff_hunk:
+            compact_files = [{
+                "filename": comment_path,
+                "status": "commented",
+                "additions": 0,
+                "deletions": 0,
+                "changes": 0,
+                "patch": _truncate(diff_hunk, 4000),
+            }]
+
+        raw_diff = render_diff_text(compact_files)
+
+        meta = {
+            "delivery_id": delivery_id,
+            "event_type": event_type,
+            "action": payload.get("action"),
+            "comment_body": _truncate(comment_body, 2000),
+            "comment_path": comment_path,
+            "pr_title": pr.get("title"),
+            "pr_number": pr_number,
+            "in_reply_to_id": comment.get("in_reply_to_id"),
+        }
+        summary_text = summarize_with_llm(
+            repo_full_name, event_type, actor_login, meta, compact_files, raw_diff
+        )
+        summary_record = {
+            "summary_text": summary_text,
+            "diff_text": raw_diff,
+            "files_json": json.dumps(compact_files, ensure_ascii=True, default=str),
+        }
+        persist_event(get_db, delivery_id, event_type, payload, summary_record)
+
+        # Also update graph: the commented file is relevant to this commit
+        if comment_path and commit_sha:
+            G = load_graph()
+            file_node = f"file:{comment_path}"
+            commit_node = f"commit:{commit_sha}"
+            if not G.has_node(file_node):
+                G.add_node(file_node, type="file", repo=repo_full_name)
+            if not G.has_node(commit_node):
+                G.add_node(commit_node, type="commit", repo=repo_full_name)
+            G.add_edge(commit_node, file_node, relationship="REVIEWED")
+            save_graph(G)
+
+        return {
+            "repository_full_name": repo_full_name,
+            "commit_sha": commit_sha,
+            "pr_number": pr_number,
+            "summary_text": summary_text,
+            "source_url": source_url,
+        }
+
+    # Push event — iterate over ALL commits in the push
+    commits_in_push = payload.get("commits", [])
+    results = []
+
+    if commits_in_push:
+        for c in commits_in_push:
+            sha = c.get("id")
+            if sha:
+                try:
+                    result = _process_single_commit(
+                        get_db, repo_full_name, sha, actor_login, delivery_id
+                    )
+                    results.append(result)
+                except Exception as e:
+                    logger.warning("Error processing commit %s in push: %s", sha[:8], e)
     else:
+        # Fallback: payload["after"] only (e.g. tag pushes, force-pushes with no commits array)
         commit_sha = payload.get("after")
         if not commit_sha:
             raise ValueError("Missing commit SHA in webhook payload")
-        commit_payload, files = fetch_commit_files(repo_full_name, commit_sha)
-        meta["commit_message"] = (commit_payload.get("commit") or {}).get("message")
-        source_url = (commit_payload.get("html_url")) or repository.get("html_url")
-        pr_number = None
+        result = _process_single_commit(
+            get_db, repo_full_name, commit_sha, actor_login, delivery_id
+        )
+        results.append(result)
 
-    compact_files = build_compact_diff(files)
-    
-    # Extract and store graph dependencies
-    dependencies = extract_file_dependencies(compact_files)
-    if dependencies:
-        logger.info(f"Graph Extraction - Found {len(dependencies)} dependency edges.")
-        update_knowledge_graph(repo_full_name, commit_sha, dependencies)
-
-    raw_diff = render_diff_text(compact_files)
-    summary_text = summarize_with_llm(repo_full_name, event_type, actor_login, meta, compact_files, raw_diff)
-    summary_record = {
-        "summary_text": summary_text,
-        "diff_text": raw_diff,
-        "files_json": json.dumps(compact_files, ensure_ascii=True, default=str),
-    }
-
-    persist_event(get_db, delivery_id, event_type, payload, summary_record)
-    
+    # Return info about the head commit
+    head_result = results[-1] if results else {}
     return {
         "repository_full_name": repo_full_name,
-        "commit_sha": commit_sha,
-        "pr_number": pr_number,
-        "summary_text": summary_text,
-        "source_url": source_url,
+        "commit_sha": head_result.get("commit_sha"),
+        "pr_number": None,
+        "summary_text": head_result.get("summary_text", ""),
+        "source_url": head_result.get("source_url", ""),
+        "commits_processed": len(results),
     }
 
 def enqueue_github_event(get_db, payload, event_type, delivery_id):
@@ -525,19 +744,25 @@ def fetch_recent_summaries(get_db, repository_full_name=None, limit=10, keyword=
 #answe from summaries upgraded
 
 def answer_from_summaries(question, summaries):
-    api_key = os.getenv("LLM_API_KEY") 
-    # Force a stable, known model that supports systemInstructions
-    model = os.getenv("LLM_MODEL", "gemini-1.5-flash") 
-    
+    api_key = os.getenv("LLM_API_KEY")
+    model = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+
+    # Top 3 results get full diff context; rest get summary only
+    detailed = summaries[:3]
+    brief = summaries[3:]
+
     condensed_context = "\n\n".join(
         [
             f"Repo: {item['repository_full_name']}\n"
-            f"Event: {item['event_type']}\n"
             f"Commit: {item.get('commit_sha')}\n"
             f"Summary: {item['summary_text']}\n"
-            f"Files Touched: {item.get('files_json')}\n"
-            f"Time: {item.get('created_at')}"
-            for item in summaries
+            f"Files: {item.get('files_json')}\n"
+            f"Diff:\n{str(item.get('diff_text', ''))[:3000]}"
+            for item in detailed
+        ] + [
+            f"Repo: {item['repository_full_name']}\n"
+            f"Summary: {item['summary_text']}"
+            for item in brief
         ]
     )
 
@@ -556,24 +781,28 @@ def answer_from_summaries(question, summaries):
         }],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 2000  # Enforcing a massive limit
+            "maxOutputTokens": 2000
         }
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
-        
-        # --- NEW: DEBUGGING OUTPUT ---
-        print("\n=== RAW LLM RESPONSE STATUS ===")
-        print(f"Status Code: {response.status_code}")
-        
+        # EXPONENTIAL BACKOFF RETRY LOOP
+        for attempt in range(5):
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            
+            if response.status_code == 429:
+                sleep_time = 2 ** attempt  # Wait 1, 2, 4, 8, 16 seconds
+                logger.warning("429 Rate limit hit in answer_from_summaries. Retrying in %ss...", sleep_time)
+                time.sleep(sleep_time)
+                continue
+                
+            response.raise_for_status()
+            break  # Success, exit the retry loop
+        else:
+            # If the loop completes without breaking, we've exhausted our retries
+            response.raise_for_status()
+
         data = response.json()
-        print("\n=== RAW LLM JSON DATA ===")
-        print(json.dumps(data, indent=2))
-        print("===============================\n")
-        # -----------------------------
-        
-        response.raise_for_status()
         
         # Safely extract text
         try:
@@ -591,7 +820,6 @@ def answer_from_summaries(question, summaries):
     except Exception as exc:
         logger.exception("LLM chat answer failed: %s", exc)
         return f"API Error: {exc}"
-
 
 def extract_search_term(question):
     """
@@ -645,3 +873,505 @@ def build_summary_query_result(question, summaries):
             scored.sort(key=lambda pair: pair[0], reverse=True)
             return [item for _, item in scored]
     return summaries
+
+
+# ==========================================
+# BOOTSTRAP ENGINE (Gaps 1, 2, 3)
+# ==========================================
+
+def ensure_bootstrap_table(get_db):
+    """Creates the github_bootstrap_status table if it doesn't exist."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS github_bootstrap_status (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                repository_full_name VARCHAR(255) UNIQUE NOT NULL,
+                status ENUM('pending', 'in_progress', 'completed', 'failed') DEFAULT 'pending',
+                commits_processed INT DEFAULT 0,
+                files_scanned INT DEFAULT 0,
+                error_detail TEXT,
+                started_at TIMESTAMP NULL,
+                completed_at TIMESTAMP NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def get_bootstrap_status(get_db, repo_full_name):
+    """Returns the bootstrap status dict for a repo, or None if never started."""
+    conn = get_db()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT * FROM github_bootstrap_status WHERE repository_full_name = %s",
+            (repo_full_name,)
+        )
+        return cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def set_bootstrap_status(get_db, repo_full_name, status, detail="",
+                         commits_processed=None, files_scanned=None):
+    """Upserts the bootstrap status for a repo."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        now = datetime.utcnow()
+        started_at = now if status == "in_progress" else None
+        completed_at = now if status in ("completed", "failed") else None
+
+        cursor.execute(
+            """
+            INSERT INTO github_bootstrap_status
+                (repository_full_name, status, error_detail, commits_processed,
+                 files_scanned, started_at, completed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                status = VALUES(status),
+                error_detail = VALUES(error_detail),
+                commits_processed = COALESCE(VALUES(commits_processed), commits_processed),
+                files_scanned = COALESCE(VALUES(files_scanned), files_scanned),
+                started_at = COALESCE(VALUES(started_at), started_at),
+                completed_at = VALUES(completed_at)
+            """,
+            (repo_full_name, status, detail,
+             commits_processed or 0, files_scanned or 0,
+             started_at, completed_at),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _get_default_branch(repo_full_name):
+    """Fetches the default branch name for a repo."""
+    url = f"{GITHUB_API_BASE}/repos/{repo_full_name}"
+    data = _fetch_json(url)
+    return data.get("default_branch", "main")
+
+
+# ------------------------------------------------------------------
+# Gap 3: Repo-wide file tree awareness
+# ------------------------------------------------------------------
+
+def scan_repo_tree(repo_full_name):
+    """Fetches the full file tree and adds file/directory nodes to the graph.
+
+    Returns the list of source-file paths suitable for full-content scanning.
+    """
+    default_branch = _get_default_branch(repo_full_name)
+    url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/git/trees/{default_branch}"
+    data = _fetch_json(url, params={"recursive": "1"})
+
+    tree = data.get("tree", [])
+    if not tree:
+        logger.warning("scan_repo_tree: empty tree for %s", repo_full_name)
+        return []
+
+    G = load_graph()
+    source_files = []
+    directories_seen = set()
+
+    for item in tree:
+        path = item.get("path", "")
+        item_type = item.get("type")  # "blob" or "tree"
+
+        if _is_noise_file(path):
+            continue
+
+        if item_type == "tree":
+            # Directory node
+            dir_node = f"directory:{path}"
+            dir_basename = path.rsplit("/", 1)[-1].lower()
+            is_utility = dir_basename in UTILITY_DIRS
+            G.add_node(dir_node, type="directory", repo=repo_full_name,
+                       utility=is_utility)
+            directories_seen.add(path)
+
+            # Link to parent directory
+            if "/" in path:
+                parent_path = path.rsplit("/", 1)[0]
+                parent_node = f"directory:{parent_path}"
+                G.add_edge(parent_node, dir_node, relationship="CONTAINS")
+
+        elif item_type == "blob":
+            # File node
+            file_node = f"file:{path}"
+            name_no_ext = path.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+            ext = ("." + path.rsplit(".", 1)[1].lower()) if "." in path else ""
+            is_entry = name_no_ext in ENTRY_POINT_NAMES
+            G.add_node(file_node, type="file", repo=repo_full_name,
+                       entry_point=is_entry)
+
+            # Link to parent directory
+            if "/" in path:
+                parent_path = path.rsplit("/", 1)[0]
+                parent_node = f"directory:{parent_path}"
+                if parent_path not in directories_seen:
+                    G.add_node(parent_node, type="directory",
+                               repo=repo_full_name)
+                    directories_seen.add(parent_path)
+                G.add_edge(parent_node, file_node, relationship="CONTAINS")
+
+            # Collect scannable source files
+            if ext in SOURCE_EXTENSIONS:
+                source_files.append(path)
+
+    save_graph(G)
+    logger.info("scan_repo_tree complete for %s | %d files, %d dirs added",
+                repo_full_name, len(source_files), len(directories_seen))
+    return source_files
+
+
+# ------------------------------------------------------------------
+# Gap 2: Full-file dependency scan
+# ------------------------------------------------------------------
+
+def extract_imports_from_source(filepath, source_code):
+    """Parses the full source code of a file for import/require statements.
+
+    Unlike extract_file_dependencies() which only reads diff patches,
+    this scans every line to catch pre-existing imports.
+    """
+    dependencies = []
+    patterns = [
+        r"^\s*from\s+([a-zA-Z0-9_.-]+)\s+import",
+        r"^\s*import\s+([a-zA-Z0-9_.-]+)",
+        r"from\s+['\"]([^'\"]+)['\"]",
+        r"require\(['\"]([^'\"]+)['\"]\)",
+        r"#include\s*[<\"]([^>\"]+)[>\"]",
+        r"use\s+([a-zA-Z0-9_:]+)",
+    ]
+
+    for line in source_code.split("\n"):
+        stripped = line.strip()
+        # Skip comments and blank lines for speed
+        if not stripped or stripped.startswith("#") and not stripped.startswith("#include"):
+            continue
+
+        for pattern in patterns:
+            match = re.search(pattern, stripped)
+            if match:
+                target_module = match.group(1)
+                edge = (filepath, "DEPENDS_ON", target_module)
+                if edge not in dependencies:
+                    dependencies.append(edge)
+    return dependencies
+
+
+def scan_file_contents(repo_full_name, file_paths):
+    """Fetches raw content for each source file and scans for dependencies.
+
+    Adds DEPENDS_ON edges to the knowledge graph for every import found.
+    Returns the total number of files successfully scanned.
+    """
+    if not file_paths:
+        return 0
+
+    G = load_graph()
+    scanned = 0
+
+    for path in file_paths:
+        try:
+            url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/contents/{path}"
+            data = _fetch_json(url)
+
+            # GitHub returns base64-encoded content for files < 1MB
+            content_b64 = data.get("content")
+            if not content_b64:
+                continue
+
+            source_code = base64.b64decode(content_b64).decode("utf-8", errors="replace")
+            deps = extract_imports_from_source(path, source_code)
+
+            file_node = f"file:{path}"
+            if not G.has_node(file_node):
+                G.add_node(file_node, type="file", repo=repo_full_name)
+
+            for source, rel, target in deps:
+                target_node = f"module:{target}"
+                if not G.has_node(target_node):
+                    G.add_node(target_node, type="module")
+                G.add_edge(file_node, target_node, relationship=rel)
+
+            scanned += 1
+
+            # Respect rate limits: sleep between requests
+            time.sleep(0.1)
+
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 403:
+                # Rate limit hit — back off
+                logger.warning("Rate limit hit scanning %s, sleeping 60s", path)
+                time.sleep(60)
+            else:
+                logger.warning("HTTP error scanning %s: %s", path, e)
+        except Exception as e:
+            logger.warning("Error scanning file %s: %s", path, e)
+
+    save_graph(G)
+    logger.info("scan_file_contents complete for %s | %d/%d files scanned",
+                repo_full_name, scanned, len(file_paths))
+    return scanned
+
+
+# ------------------------------------------------------------------
+# Gap 1: Historical commit backfill
+# ------------------------------------------------------------------
+
+def backfill_commits(get_db, repo_full_name, max_commits=None):
+    """Paginates through the full commit history and processes each commit.
+
+    For each commit: fetches files, extracts dependencies, updates the
+    knowledge graph, and persists a summary record so the chatbot has
+    historical data to query.
+
+    Returns the number of commits processed.
+    """
+    if max_commits is None:
+        max_commits = BOOTSTRAP_MAX_COMMITS
+
+    processed = 0
+    page = 1
+    per_page = 100
+
+    while processed < max_commits:
+        try:
+            url = f"{GITHUB_API_BASE}/repos/{repo_full_name}/commits"
+            params = {"per_page": per_page, "page": page}
+            response = requests.get(url, headers=_github_headers(),
+                                    params=params, timeout=30)
+            response.raise_for_status()
+            commits = response.json()
+
+            if not commits:
+                break
+
+            for commit_data in commits:
+                if processed >= max_commits:
+                    break
+
+                sha = commit_data.get("sha")
+                if not sha:
+                    continue
+
+                try:
+                    # Fetch full commit details with file diffs
+                    commit_payload, files = fetch_commit_files(repo_full_name, sha)
+                    compact_files = build_compact_diff(files)
+
+                    # Extract dependencies and update graph
+                    dependencies = extract_file_dependencies(compact_files)
+                    if dependencies:
+                        update_knowledge_graph(repo_full_name, sha, dependencies)
+
+                    # Build and persist summary
+                    commit_info = commit_data.get("commit", {})
+                    actor_login = ((commit_data.get("author") or {}).get("login")
+                                   or (commit_info.get("author") or {}).get("name")
+                                   or "unknown")
+                    commit_msg = commit_info.get("message", "")
+                    commit_date = commit_info.get("author", {}).get("date", "")
+
+                    raw_diff = render_diff_text(compact_files)
+                    meta = {
+                        "event_type": "push",
+                        "commit_message": commit_msg,
+                        "backfill": True,
+                    }
+
+                    summary_text = heuristic_summary(
+                        repo_full_name, "push", compact_files, meta
+                    )
+
+                    delivery_id = f"backfill-{sha[:12]}"
+                    summary_record = {
+                        "summary_text": summary_text,
+                        "diff_text": raw_diff,
+                        "files_json": json.dumps(
+                            compact_files, ensure_ascii=True, default=str
+                        ),
+                    }
+
+                    # Persist — uses ON DUPLICATE KEY so re-runs are safe
+                    conn = get_db()
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute(
+                            """
+                            INSERT INTO github_events
+                            (delivery_id, event_type, repository_full_name,
+                             actor_login, commit_sha, source_url, payload_json)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            ON DUPLICATE KEY UPDATE delivery_id=delivery_id
+                            """,
+                            (
+                                delivery_id, "push", repo_full_name,
+                                actor_login, sha,
+                                commit_data.get("html_url", ""),
+                                json.dumps({"backfill": True, "sha": sha},
+                                           default=str),
+                            ),
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO github_summaries
+                            (delivery_id, event_type, repository_full_name,
+                             actor_login, commit_sha, source_url,
+                             summary_text, diff_text, files_json)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON DUPLICATE KEY UPDATE delivery_id=delivery_id
+                            """,
+                            (
+                                delivery_id, "push", repo_full_name,
+                                actor_login, sha,
+                                commit_data.get("html_url", ""),
+                                summary_record["summary_text"],
+                                summary_record.get("diff_text"),
+                                summary_record.get("files_json"),
+                            ),
+                        )
+                        conn.commit()
+                    finally:
+                        cursor.close()
+                        conn.close()
+
+                    processed += 1
+                    if processed % 25 == 0:
+                        logger.info(
+                            "Backfill progress: %d/%d commits for %s",
+                            processed, max_commits, repo_full_name
+                        )
+
+                    # Respect rate limits
+                    time.sleep(0.5)
+
+                except Exception as e:
+                    logger.warning(
+                        "Error backfilling commit %s: %s", sha[:8], e
+                    )
+                    continue
+
+            # Check rate limit headers
+            remaining = response.headers.get("X-RateLimit-Remaining")
+            if remaining and int(remaining) < 10:
+                reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
+                sleep_for = max(reset_time - int(time.time()), 60)
+                logger.warning(
+                    "Rate limit nearly exhausted (%s remaining), sleeping %ds",
+                    remaining, sleep_for
+                )
+                time.sleep(sleep_for)
+
+            if len(commits) < per_page:
+                break  # Last page
+
+            page += 1
+            time.sleep(0.5)
+
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 403:
+                logger.warning("Rate limit hit during backfill, sleeping 60s")
+                time.sleep(60)
+            else:
+                logger.error("HTTP error during backfill: %s", e)
+                break
+        except Exception as e:
+            logger.error("Unexpected error during backfill: %s", e)
+            break
+
+    logger.info(
+        "backfill_commits complete for %s | %d commits processed",
+        repo_full_name, processed
+    )
+    return processed
+
+
+# ------------------------------------------------------------------
+# Bootstrap coordinator
+# ------------------------------------------------------------------
+
+def bootstrap_repo(get_db, repo_full_name):
+    """Runs the full bootstrap pipeline: tree scan → file scan → commit backfill.
+
+    Updates status in the github_bootstrap_status table throughout.
+    Skips if already completed (unless force=True via set_bootstrap_status reset).
+    """
+    existing = get_bootstrap_status(get_db, repo_full_name)
+    if existing and existing.get("status") == "completed":
+        logger.info("Bootstrap already completed for %s, skipping", repo_full_name)
+        return
+
+    logger.info("Starting bootstrap for %s", repo_full_name)
+    set_bootstrap_status(get_db, repo_full_name, "in_progress")
+
+    try:
+        # Gap 3: Scan repo tree structure
+        logger.info("[Bootstrap %s] Phase 1/3: Scanning file tree…", repo_full_name)
+        source_files = scan_repo_tree(repo_full_name)
+
+        # Gap 2: Full-file dependency scan
+        logger.info(
+            "[Bootstrap %s] Phase 2/3: Scanning %d source files for imports…",
+            repo_full_name, len(source_files)
+        )
+        files_scanned = scan_file_contents(repo_full_name, source_files)
+        set_bootstrap_status(
+            get_db, repo_full_name, "in_progress",
+            detail=f"File scan done: {files_scanned} files",
+            files_scanned=files_scanned
+        )
+
+        # Gap 1: Historical commit backfill
+        logger.info(
+            "[Bootstrap %s] Phase 3/3: Backfilling commit history…",
+            repo_full_name
+        )
+        commits_processed = backfill_commits(get_db, repo_full_name)
+
+        set_bootstrap_status(
+            get_db, repo_full_name, "completed",
+            detail=f"Done: {files_scanned} files scanned, "
+                   f"{commits_processed} commits backfilled",
+            commits_processed=commits_processed,
+            files_scanned=files_scanned,
+        )
+        logger.info(
+            "Bootstrap COMPLETE for %s | %d files, %d commits",
+            repo_full_name, files_scanned, commits_processed
+        )
+
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("Bootstrap FAILED for %s: %s", repo_full_name, exc)
+        set_bootstrap_status(
+            get_db, repo_full_name, "failed", detail=error_msg
+        )
+
+
+def enqueue_bootstrap(get_db, repo_full_name):
+    """Launches bootstrap_repo in a daemon thread (non-blocking).
+
+    Same pattern as enqueue_github_event — fire-and-forget so the
+    HTTP handler returns immediately.
+    """
+    worker = threading.Thread(
+        target=bootstrap_repo,
+        args=(get_db, repo_full_name),
+        daemon=True,
+        name=f"bootstrap-{repo_full_name}",
+    )
+    worker.start()
+    logger.info("Bootstrap thread started for %s", repo_full_name)
+    return worker
