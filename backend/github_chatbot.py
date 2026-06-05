@@ -32,6 +32,7 @@ try:
         fetch_summaries_by_commits,
         get_bootstrap_status,
         enqueue_bootstrap,
+        classify_query_intent
     )
     IMPORT_OK = True
 except ImportError as _ie:
@@ -269,14 +270,18 @@ if user_q := st.chat_input("e.g. What files changed in the last commit?"):
                 repos_to_query = st.session_state.selected_repos
                 limit = st.session_state.result_limit
                 
+                intent = classify_query_intent(user_q)
                 search_keyword = extract_search_term(user_q)
                 all_summaries = []
-                
+
                 # 1. Knowledge Graph Check
-                if search_keyword:
-                    st.toast(f"🔍 Searching graph for: {search_keyword}")
-                    targeted_commits = get_commits_from_graph(search_keyword, max_hops=2)
-                    
+                if intent != "recent" and search_keyword:
+                    st.toast(f"🔍 Graph traversal: {intent} → '{search_keyword}'")
+                    targeted_commits = get_commits_from_graph(
+                        search_keyword,
+                        max_hops=2,
+                        intent=intent,
+                    )
                     if targeted_commits:
                         st.toast(f"🎯 Graph found {len(targeted_commits)} relevant commits!")
                         all_summaries = fetch_summaries_by_commits(get_db, targeted_commits)

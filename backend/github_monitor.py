@@ -331,8 +331,11 @@ def persist_event(get_db, delivery_id, event_type, payload, summary_record=None)
 # GRAPH RAG UTILS (Phases 1, 2, and 3)
 # ==========================================
 
+_graph_lock = threading.Lock()
+
 def load_graph():
-    """Loads the graph from disk, or creates a new directed graph."""
+    with _graph_lock:
+        """Loads the graph from disk, or creates a new directed graph."""
     if os.path.exists(GRAPH_FILE):
         try:
             with open(GRAPH_FILE, 'r') as f:
@@ -344,12 +347,33 @@ def load_graph():
 
 def save_graph(G):
     """Saves the graph state to disk."""
-    data = json_graph.node_link_data(G)
-    with open(GRAPH_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+    with _graph_lock:
+        """Loads the graph from disk, or creates a new directed graph."""
+        if os.path.exists(GRAPH_FILE):
+            try:
+                with open(GRAPH_FILE, 'r') as f:
+                    data = json.load(f)
+                    return json_graph.node_link_graph(data)
+            except Exception as e:
+                logger.error(f"Failed to load graph: {e}")
+        return nx.DiGraph()
 
 def update_knowledge_graph(repo_full_name, commit_sha, dependencies):
     """Integrates extracted dependencies into the global knowledge graph."""
+    author_node = f"author:{actor_login}"
+    G.add_node(author_node, type="author")
+    G.add_edge(author_node, commit_node, relationship="AUTHORED")
+
+    # On commit nodes, store timestamp:
+    G.add_node(commit_node, type="commit", repo=repo_full_name,
+           timestamp=committed_at,   # ← add this
+           author=actor_login)       # ← add this
+
+    # On edges, store timestamp too:
+    G.add_edge(commit_node, source_node,
+           relationship="MODIFIED",
+           timestamp=committed_at)   # ← so you can time-filter traversals
+   
     if not dependencies:
         return
         
@@ -400,28 +424,233 @@ def extract_file_dependencies(compact_files):
                         dependencies.append(edge)
     return dependencies
 
-def get_commits_from_graph(keyword, max_hops=1):
-    """Searches the graph for a file or module and returns related commit SHAs."""
+# ==========================================
+# GRAPH RAG — QUERY FUNCTIONS
+# ==========================================
+
+# Patterns for classifying query intent before hitting the graph
+_INTENT_PATTERNS = [
+    ("blast_radius", re.compile(
+        r"\b(impact|affect|break|depend|downstream|ripple|what.{0,20}uses|which.{0,20}import|if.{0,20}change)\b",
+        re.I,
+    )),
+    ("author_query", re.compile(
+        r"\b(who|author|wrote|pushed|committed.by|changes.by)\b",
+        re.I,
+    )),
+    ("file_history", re.compile(
+        r"\b(history|when.{0,10}added|what.{0,20}changed.in|commits.{0,10}touching|touched|modified)\b",
+        re.I,
+    )),
+    ("module_origin", re.compile(
+        r"\b(where.{0,10}import|what.{0,10}uses|which.{0,10}depend|added.{0,10}import|introduced)\b",
+        re.I,
+    )),
+]
+
+def _load_graph_safe():
+    """Loads the graph, returning an empty DiGraph on any failure."""
     if not os.path.exists(GRAPH_FILE):
-        return []
-        
+        logger.warning("Graph file not found at %s — graph queries will return empty", GRAPH_FILE)
+        return None
     G = load_graph()
-    if not G.nodes:
+    if not G or not G.nodes:
+        logger.warning("Graph loaded but is empty")
+        return None
+    return G
+
+
+def classify_query_intent(question: str) -> str:
+    """
+    Returns one of: 'blast_radius', 'author_query', 'file_history',
+    'module_origin', or 'recent' (the fallback that skips the graph entirely).
+    """
+    for intent, pattern in _INTENT_PATTERNS:
+        if pattern.search(question):
+            logger.info("Query intent classified as '%s' for: %s", intent, question)
+            return intent
+    return "recent"
+
+
+def get_blast_radius_commits(keyword: str, max_hops: int = 2):
+    """
+    Forward traversal: given a file or module name, find all commits that
+    have ever touched files which depend on that module — i.e. 'if this
+    changes, what commits are likely affected?'
+
+    Graph path:
+        module:{keyword} <-DEPENDS_ON- file:X -MODIFIED- commit:Y
+    """
+    G = _load_graph_safe()
+    if G is None:
         return []
 
-    target_nodes = [n for n in G.nodes if keyword.lower() in n.lower()]
-    if not target_nodes:
+    # Match any node whose name contains the keyword
+    seed_nodes = [n for n in G.nodes if keyword.lower() in n.lower()]
+    if not seed_nodes:
+        logger.info("blast_radius: no graph nodes matching '%s'", keyword)
         return []
 
-    undirected_G = G.to_undirected()
-    relevant_commits = set()
-    for node in target_nodes:
-        neighborhood = nx.single_source_shortest_path_length(undirected_G, node, cutoff=max_hops)
-        for neighbor in neighborhood:
-            if neighbor.startswith("commit:"):
-                relevant_commits.add(neighbor.replace("commit:", ""))
-                
-    return list(relevant_commits)
+    commits = set()
+    for seed in seed_nodes:
+        node_type = G.nodes[seed].get("type", "")
+
+        if node_type == "module":
+            # Find files that import this module (predecessors of module node)
+            dependent_files = [
+                src for src in G.predecessors(seed)
+                if G.nodes[src].get("type") == "file"
+            ]
+            for file_node in dependent_files:
+                # Find commits that modified those files
+                for src in G.predecessors(file_node):
+                    if src.startswith("commit:"):
+                        commits.add(src.replace("commit:", ""))
+
+        elif node_type == "file":
+            # Direct: find commits that modified this file
+            for src in G.predecessors(seed):
+                if src.startswith("commit:"):
+                    commits.add(src.replace("commit:", ""))
+            # Also walk one hop further: modules this file depends on,
+            # then other files that depend on those same modules
+            if max_hops >= 2:
+                for mod_node in G.successors(seed):
+                    if G.nodes[mod_node].get("type") == "module":
+                        for sibling_file in G.predecessors(mod_node):
+                            if sibling_file != seed and G.nodes[sibling_file].get("type") == "file":
+                                for src in G.predecessors(sibling_file):
+                                    if src.startswith("commit:"):
+                                        commits.add(src.replace("commit:", ""))
+
+    logger.info("blast_radius: found %d commits for keyword '%s'", len(commits), keyword)
+    return list(commits)
+
+
+def get_commits_by_author(keyword: str):
+    """
+    Author traversal: find all commits attributed to an author whose login
+    contains the keyword.
+
+    Graph path:
+        author:{keyword} -AUTHORED-> commit:Y
+
+    Falls back to scanning commit node attributes if no author nodes exist
+    (i.e. the graph was built before author nodes were added).
+    """
+    G = _load_graph_safe()
+    if G is None:
+        return []
+
+    commits = set()
+
+    # Primary: walk AUTHORED edges from matching author nodes
+    author_nodes = [
+        n for n in G.nodes
+        if n.startswith("author:") and keyword.lower() in n.lower()
+    ]
+    for author_node in author_nodes:
+        for commit_node in G.successors(author_node):
+            if commit_node.startswith("commit:"):
+                commits.add(commit_node.replace("commit:", ""))
+
+    # Fallback: scan author attribute on commit nodes (older graph format)
+    if not commits:
+        for node, attrs in G.nodes(data=True):
+            if node.startswith("commit:") and keyword.lower() in str(attrs.get("author", "")).lower():
+                commits.add(node.replace("commit:", ""))
+
+    logger.info("author_query: found %d commits for keyword '%s'", len(commits), keyword)
+    return list(commits)
+
+
+def get_file_history_commits(keyword: str):
+    """
+    File history traversal: find all commits that have ever modified a file
+    whose path contains the keyword.
+
+    Graph path:
+        commit:Y -MODIFIED-> file:{keyword}
+    """
+    G = _load_graph_safe()
+    if G is None:
+        return []
+
+    file_nodes = [
+        n for n in G.nodes
+        if n.startswith("file:") and keyword.lower() in n.lower()
+    ]
+    if not file_nodes:
+        logger.info("file_history: no file nodes matching '%s'", keyword)
+        return []
+
+    commits = set()
+    for file_node in file_nodes:
+        for src in G.predecessors(file_node):
+            if src.startswith("commit:"):
+                commits.add(src.replace("commit:", ""))
+
+    logger.info("file_history: found %d commits for keyword '%s'", len(commits), keyword)
+    return list(commits)
+
+
+def get_commits_from_graph(keyword: str, max_hops: int = 2, intent: str = "auto"):
+    """
+    Unified entry point for all graph-based commit lookups.
+
+    Parameters
+    ----------
+    keyword : str
+        The technical term extracted from the user's question (file name,
+        module name, author login, etc.)
+    max_hops : int
+        How far to traverse from the seed nodes. Only used by blast_radius.
+    intent : str
+        One of 'blast_radius', 'author_query', 'file_history',
+        'module_origin', or 'auto'. When 'auto', the function inspects
+        the keyword itself to pick the right traversal — useful when the
+        caller has already extracted a keyword but hasn't classified intent.
+
+    Returns
+    -------
+    list[str]
+        Commit SHAs. Empty list if the graph is missing, empty, or the
+        keyword matches nothing.
+    """
+    if not keyword:
+        return []
+
+    if intent == "auto":
+        # Infer from the keyword shape rather than the full question
+        if keyword.startswith("author:") or re.match(r"^[a-z0-9_-]{1,39}$", keyword, re.I):
+            # Looks like a GitHub login — try author traversal first
+            result = get_commits_by_author(keyword.replace("author:", ""))
+            if result:
+                return result
+        if "." in keyword or "/" in keyword or "_" in keyword:
+            # Looks like a file path or module name — prefer file history
+            result = get_file_history_commits(keyword)
+            if result:
+                return result
+            # If nothing, try it as a module (blast radius)
+            return get_blast_radius_commits(keyword, max_hops)
+        # Generic keyword — try all modes, return first non-empty result
+        for fn in (get_file_history_commits, get_blast_radius_commits,
+                   get_commits_by_author):
+            result = fn(keyword) if fn != get_blast_radius_commits else fn(keyword, max_hops)
+            if result:
+                return result
+        return []
+
+    if intent == "blast_radius":
+        return get_blast_radius_commits(keyword, max_hops)
+    if intent == "author_query":
+        return get_commits_by_author(keyword)
+    if intent in ("file_history", "module_origin"):
+        result = get_file_history_commits(keyword)
+        return result if result else get_blast_radius_commits(keyword, max_hops)
+
+    return []
 
 def fetch_summaries_by_commits(get_db, commit_shas):
     """Fetches full summaries from MySQL for specific SHAs."""
