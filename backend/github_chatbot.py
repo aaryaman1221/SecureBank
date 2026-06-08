@@ -7,6 +7,12 @@ across one or more repositories.
 
 import os
 import streamlit as st
+import logging
+from tqdm import tqdm
+import re
+
+# Add this to force Python to print your INFO logs to the terminal
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 # st.set_page_config MUST be the first Streamlit call
 st.set_page_config(
@@ -28,11 +34,13 @@ try:
         ensure_github_tables,
         fetch_recent_summaries,
         extract_search_term,
+        classify_query_intent,
         get_commits_from_graph,
         fetch_summaries_by_commits,
         get_bootstrap_status,
         enqueue_bootstrap,
-        classify_query_intent
+        get_blast_radius_from_commit_sha,
+        get_commits_by_author,
     )
     IMPORT_OK = True
 except ImportError as _ie:
@@ -273,43 +281,94 @@ if user_q := st.chat_input("e.g. What files changed in the last commit?"):
                 intent = classify_query_intent(user_q)
                 search_keyword = extract_search_term(user_q)
                 all_summaries = []
+                graph_used = False
 
-                # 1. Knowledge Graph Check
-                if intent != "recent" and search_keyword:
-                    st.toast(f"🔍 Graph traversal: {intent} → '{search_keyword}'")
+                # ── Path 1: SHA query ──────────────────────────────────────────
+                sha_match = re.search(r'\b[0-9a-f]{7,40}\b', user_q, re.IGNORECASE)
+                if sha_match:
+                    sha = sha_match.group(0)
+                    targeted_commits = get_commits_from_graph(sha, max_hops=2, intent="blast_radius")
+                    if targeted_commits:
+                        all_summaries = fetch_summaries_by_commits(get_db, targeted_commits)
+                        graph_used = True
+                    # If SHA not in graph yet, fall back to direct DB lookup
+                    if not all_summaries:
+                        all_summaries = fetch_recent_summaries(get_db, limit=limit, keyword=sha)
+
+                # ── Path 2: Keyword + intent (file, module, author) ────────────
+                elif search_keyword and intent != "recent":
                     targeted_commits = get_commits_from_graph(
-                        search_keyword,
-                        max_hops=2,
-                        intent=intent,
+                        search_keyword, max_hops=2, intent=intent
                     )
                     if targeted_commits:
-                        st.toast(f"🎯 Graph found {len(targeted_commits)} relevant commits!")
                         all_summaries = fetch_summaries_by_commits(get_db, targeted_commits)
-                
-                # 2. UPGRADE 1: REVERSE TRAVERSAL IMPACT ANALYSIS
+                        graph_used = True
+
+                # ── Path 3: Author query (no dot/slash keyword needed) ─────────
+                # elif intent == "author_query":
+                #     # extract_search_term fails for plain names — extract differently
+                #     words = [w for w in user_q.lower().split() 
+                #             if len(w) > 2 and w not in {"who", "what", "when", "did", "the"}]
+                #     for word in words:
+                #         targeted_commits = get_commits_by_author(word)
+                #         if targeted_commits:
+                #             all_summaries = fetch_summaries_by_commits(get_db, targeted_commits)
+                #             graph_used = True
+                #             break
+
+                # ── Path 4: Recent/broad — go straight to SQL, skip fake graph ─
                 if not all_summaries:
-                    st.toast("⚠️ Broad query. Triggering Graph Impact Analysis on latest push...")
+                    if repos_to_query:
+                        for repo in repos_to_query:
+                            all_summaries.extend(fetch_recent_summaries(get_db, repo, limit))
+                    else:
+                        all_summaries = fetch_recent_summaries(get_db, limit=limit)
+
+                all_summaries = all_summaries[:limit]
+                ranked = build_summary_query_result(user_q, all_summaries)
+                answer = answer_from_summaries(user_q, ranked)
+
+                if graph_used:
+                    st.success(f"Graph traversal: `{intent}` → `{search_keyword}` → {len(all_summaries)} commits")
+                else:
+                    st.info("SQL fallback — no graph match for this query")   
+
+                # 1. Knowledge Graph Check (only for structural queries)
+                # if intent != "recent" and search_keyword:
+                #     st.toast(f"🔍 Graph traversal: {intent} → '{search_keyword}'")
+                #     targeted_commits = get_commits_from_graph(
+                #         search_keyword,
+                #         max_hops=2,
+                #         intent=intent,
+                #     )
+                #     if targeted_commits:
+                #         st.toast(f"🎯 Graph found {len(targeted_commits)} relevant commits!")
+                #         all_summaries = fetch_summaries_by_commits(get_db, targeted_commits)
+                
+                # # 2. UPGRADE 1: REVERSE TRAVERSAL IMPACT ANALYSIS
+                # if not all_summaries:
+                #     st.toast("⚠️ Broad query. Triggering Graph Impact Analysis on latest push...")
                     
-                    # Grab the single most recent commit to act as our "Graph Seed"
-                    latest_record = fetch_recent_summaries(get_db, limit=1)
+                #     # Grab the single most recent commit to act as our "Graph Seed"
+                #     latest_record = fetch_recent_summaries(get_db, limit=1)
                     
-                    if latest_record and latest_record[0].get('commit_sha'):
-                        latest_sha = latest_record[0]['commit_sha']
-                        st.toast(f"🕸️ Tracing architectural impact from commit {latest_sha[:7]}...")
+                #     if latest_record and latest_record[0].get('commit_sha'):
+                #         latest_sha = latest_record[0]['commit_sha']
+                #         st.toast(f"🕸️ Tracing architectural impact from commit {latest_sha[:7]}...")
                         
-                        # Feed the commit SHA backward into the graph (Commit -> File -> Module -> Commits)
-                        targeted_commits = get_commits_from_graph(latest_sha, max_hops=2)
+                #         # Feed the commit SHA backward into the graph (Commit -> File -> Module -> Commits)
+                #         targeted_commits = get_commits_from_graph(latest_sha, max_hops=2)
                         
-                        if targeted_commits:
-                            all_summaries = fetch_summaries_by_commits(get_db, targeted_commits)
+                #         if targeted_commits:
+                #             all_summaries = fetch_summaries_by_commits(get_db, targeted_commits)
                     
-                    # 3. Absolute last resort (e.g., brand new database with no graph data yet)
-                    if not all_summaries:
-                        if repos_to_query:
-                            for repo in repos_to_query:
-                                all_summaries.extend(fetch_recent_summaries(get_db, repo, limit))
-                        else:
-                            all_summaries = fetch_recent_summaries(get_db, limit=limit)
+                #     # 3. Absolute last resort (e.g., brand new database with no graph data yet)
+                #     if not all_summaries:
+                #         if repos_to_query:
+                #             for repo in repos_to_query:
+                #                 all_summaries.extend(fetch_recent_summaries(get_db, repo, limit))
+                #         else:
+                #             all_summaries = fetch_recent_summaries(get_db, limit=limit)
                 
                 # --- MISSING LINES RESTORED HERE ---
                 all_summaries = all_summaries[:limit]
